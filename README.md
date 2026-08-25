@@ -7,6 +7,8 @@ that can break with an OS update. The interface is a web page served
 locally and rendered by whatever browser the machine already has, which also
 means you can open it from a phone or tablet in the shack.
 
+![The RT-21 web UI: compass rose, target controls, and beam-heading presets](docs/screenshot.png)
+
 History: the original client is `rt21_network_controller.py` (untouched);
 version 2.0 was a PyQt6 rewrite (`rt21_controller.py`, still here) whose Qt
 platform plugin broke on macOS 26. Version 3.0 keeps 2.0's protocol fixes
@@ -73,8 +75,9 @@ The app speaks to the RT-21 over whichever link the controller actually has:
 
 On connect the app probes for the GHE bridge first and falls back to raw TCP;
 Settings can pin either. Note the GHE box buffers only the *last* reply, so
-polling floors at one second there, and if the box's serial link to the RT-21
-dies the displayed heading freezes rather than going stale.
+polling floors at one second there. If the box's serial link to the RT-21
+dies (an unplugged USB cable, say), the stale-data watchdog notices the
+missing heading and flags the link instead of showing an empty compass.
 
 ## Protocol corrections (inherited from 2.0)
 
@@ -135,6 +138,6 @@ stale-link watchdog, drop-and-reconnect, and clean thread shutdown:
 python3 test_web.py
 ```
 
-29 tests, ~25 s, no dependencies. Also verified live against the real RT-21
+30 tests, ~30 s, no dependencies. Also verified live against the real RT-21
 (firmware 4.13.2) through its GH Everywhere interface: connect, poll, slew,
 motion status and return-to-heading all confirmed end to end.

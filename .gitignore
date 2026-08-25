@@ -10,6 +10,7 @@ __pycache__/
 *.zip
 *.pdf
 *.png
+!docs/screenshot.png
 *.jpeg
 *.jpg
 *.msi
