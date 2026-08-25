@@ -663,7 +663,9 @@ class RotatorLink(threading.Thread):
     def _pump_ghe(self) -> None:
         """Poll the GHE bridge: send queued commands, read the reply buffer."""
         next_poll = 0.0
-        version_pending = True
+        # The version query is cosmetic; a controller (or dead serial link)
+        # that never answers it must not block heading polls forever.
+        version_tries = 3
         while not self._quit.is_set():
             while True:
                 try:
@@ -678,8 +680,10 @@ class RotatorLink(threading.Thread):
                 # the bridge needs ~0.75 s to collect the serial reply, so the
                 # effective poll floor here is one second
                 next_poll = now + max(self._cfg.poll_interval, 1.0)
-                query = self._proto.read_version() if version_pending \
+                query = self._proto.read_version() if version_tries \
                     else self._proto.read_status()
+                if version_tries:
+                    version_tries -= 1
                 if not self._ghe_send(query):
                     return
                 if self._quit.wait(0.75):
@@ -692,18 +696,18 @@ class RotatorLink(threading.Thread):
                     printable = reply.raw.replace(SOH, "<SOH>").replace("\x00", "<NUL>")
                     self._hub.publish("traffic", {"dir": "rx", "data": printable + ";"})
                     if reply.kind == "heading_status" and reply.heading is not None:
+                        version_tries = 0  # link is alive — switch to status polls
                         self._last_heading_at = time.monotonic()
                         self._hub.publish("heading", {"deg": reply.heading})
                         if reply.moving is not None and reply.moving != self._moving:
                             self._moving = reply.moving
                             self._hub.publish("motion", {"moving": reply.moving})
                     elif reply.kind == "info":
-                        version_pending = False
+                        version_tries = 0
                         LOG.info("Controller: %s", reply.text)
                         self._hub.publish("info", {"text": reply.text})
 
-            if not version_pending and \
-                    now - self._last_heading_at > max(self._cfg.stale_timeout, 5.0):
+            if now - self._last_heading_at > max(self._cfg.stale_timeout, 5.0):
                 LOG.warning("No heading from the GHE bridge — forcing a reconnect")
                 self._set_state(LinkState.ERROR, "No response from controller")
                 return

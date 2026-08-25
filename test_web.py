@@ -238,6 +238,20 @@ class GheLinkTests(unittest.TestCase):
             "stop never reached the simulator",
         )
 
+    def test_mute_serial_side_goes_stale(self) -> None:
+        """A bridge whose serial side is dead (unplugged USB) answers HTTP but
+        never buffers a reply. The link must report the fault within the stale
+        timeout instead of sitting at 'connected' with an empty compass."""
+        self.sim._command = lambda frame: None
+        self.link.start()
+        self.assertTrue(wait_for(lambda: self.link.connected, timeout=8.0),
+                        "never connected via GHE")
+        self.assertTrue(
+            wait_for(lambda: self.hub.state["link"] != "connected", timeout=15.0),
+            "dead serial side never made the link leave 'connected'",
+        )
+        self.assertIsNone(self.hub.state["heading"])
+
 
 # --------------------------------------------------------------------------- #
 class ConfigTests(unittest.TestCase):
