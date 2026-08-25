@@ -1,0 +1,3 @@
+# RT-21 web edition (rt21_web.py): standard library only, nothing to install.
+# PyQt6 below is only needed for the legacy Qt client (rt21_controller.py).
+PyQt6>=6.5

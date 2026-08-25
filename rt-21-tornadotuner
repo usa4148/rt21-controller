@@ -1,0 +1,360 @@
+[
+    {
+        "id": "fa6a8c6129318283",
+        "type": "tab",
+        "label": "RT-21 TornadoTuner",
+        "disabled": true,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "22eb3c91573dff62",
+        "type": "tcp request",
+        "z": "fa6a8c6129318283",
+        "name": "RT-21",
+        "server": "192.168.7.203",
+        "port": "6555",
+        "out": "sit",
+        "ret": "string",
+        "splitc": " ",
+        "newline": "",
+        "tls": "",
+        "x": 1390,
+        "y": 560,
+        "wires": [
+            [
+                "f8ded012de76f9f5"
+            ]
+        ]
+    },
+    {
+        "id": "c5a135a76e144ce9",
+        "type": "inject",
+        "z": "fa6a8c6129318283",
+        "name": "",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "AP1010\\r;",
+        "payloadType": "str",
+        "x": 460,
+        "y": 560,
+        "wires": [
+            [
+                "6d870999d9f7d29e"
+            ]
+        ]
+    },
+    {
+        "id": "e242c1585d5c7977",
+        "type": "inject",
+        "z": "fa6a8c6129318283",
+        "name": "",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": true,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "R21;",
+        "payloadType": "str",
+        "x": 1230,
+        "y": 500,
+        "wires": [
+            [
+                "22eb3c91573dff62"
+            ]
+        ]
+    },
+    {
+        "id": "6d870999d9f7d29e",
+        "type": "function",
+        "z": "fa6a8c6129318283",
+        "name": "",
+        "func": " var txfreq = msg.payload;\n msg.payload = \"AP0\"+txfreq+\"\\r;\";\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1000,
+        "y": 660,
+        "wires": [
+            [
+                "5585f1acb0a0f7f1"
+            ]
+        ]
+    },
+    {
+        "id": "c1526a89489ac458",
+        "type": "link in",
+        "z": "fa6a8c6129318283",
+        "name": "Link from Alpha 9500",
+        "links": [
+            "b0f99b5a3de58a7e"
+        ],
+        "x": 215,
+        "y": 660,
+        "wires": [
+            [
+                "47bada2e9879d4c2"
+            ]
+        ]
+    },
+    {
+        "id": "47bada2e9879d4c2",
+        "type": "function",
+        "z": "fa6a8c6129318283",
+        "name": "Parse XML TXFreq",
+        "func": "TXFreqRadio = msg.payload; // gets xml formatted message\nvar radionr = TXFreqRadio.RadioInfo.RadioNr;  // gets the radio number from the radioinfo msg\nvar freq=TXFreqRadio.RadioInfo.TXFreq;  // gets the tx frequency \nfreq = freq/100000;\nvar bandnum = 1;\n\n// Looks for 80 meter TX frequency on either radio\nif(radionr > 0) \n{                \nswitch(true)\n{\n    \n    case freq >= 3.5 && freq <= 3.99:\n    msg.payload = freq\n    return [msg];\n    \n} \n}\n\n\n/*\n<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<RadioInfo>\n    <app>N1MM</app>\n    <StationName>CW-80m</StationName>\n    <RadioNr>l</RadioNr>\n    <Freq>352211</Freq>\n    <TXFreq>352211</TXFreq>\n    <Mode>CW</Mode>\n    <OpCall>W1ABC</OpCall>\n    <IsRunning>False</IsRunning>\n    <FocusEntry>204626</FocusEntry>\n    <EntryWindowHwnd>\n    <Antenna>ll</Antenna>\n    <Rotors></Rotors>\n    <FocusRadioNr>l</FocusRadioNr>\n    <IsStereo>False</IsStereo>\n    <IsSplit>False</IsSplit>\n    <ActiveRadioNr>l</ActiveRadioNr>\n    <IsTransmitting>False</IsTransmitting>\n    <FunctionKeyCaption></FunctionKeyCaption>\n    <RadioName></RadioName>\n</RadioInfo>\nif( integer in range(0, 10 ) ) {\n\n}\nelse if ( integer in range( 11, 20 ) ) {\n\n\n\n}\nelse if ( integer in range( 21, 30 ) ) {\n\n\n\n}\n\nfunction range( min, max ){\nvar o = {}, i ;\n    for( i = min; i <= max; ++i ) {\n    o[i] = !0;\n    }\nreturn o;\n}\n*/",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 410,
+        "y": 660,
+        "wires": [
+            [
+                "8e3e25950b7fdf46",
+                "30724280c9e14fae"
+            ]
+        ]
+    },
+    {
+        "id": "8e3e25950b7fdf46",
+        "type": "function",
+        "z": "fa6a8c6129318283",
+        "name": "Set 9500 Band Segment",
+        "func": "var freq = msg.payload;\nvar bandsegment = 1;\n\n//var currbandseg = flow.get(\"bandsegmentcurrent\");\nswitch(true)\n{\n \n   \n    // 80 Meter Band Segmentts\n    case freq >= 3.5 && freq <= 3.55:\n    bandsegment = \"100\"\n    break;\n    case freq >= 3.55 && freq <= 3.65:\n    bandsegment = \"080\"\n    break;\n    case freq >= 3.65 && freq <= 3.75:\n    bandsegment = \"060\"\n    break;\n    case freq >= 3.75 && freq <= 3.85:\n    bandsegment = \"040\"\n    break;\n    case freq >= 3.85 && freq <= 4:\n    bandsegment = \"020\"\n    break;\n   \n}\n//if(currbandseg != bandsegment)\n//{\n\nmsg.payload = bandsegment;\nreturn msg;\n//}\n\n",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 690,
+        "y": 660,
+        "wires": [
+            [
+                "6d870999d9f7d29e",
+                "1045e61687549851"
+            ]
+        ]
+    },
+    {
+        "id": "30724280c9e14fae",
+        "type": "debug",
+        "z": "fa6a8c6129318283",
+        "name": "Parse XML TX Freq",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 710,
+        "y": 800,
+        "wires": []
+    },
+    {
+        "id": "1045e61687549851",
+        "type": "debug",
+        "z": "fa6a8c6129318283",
+        "name": "Set Segment",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1090,
+        "y": 800,
+        "wires": []
+    },
+    {
+        "id": "dd99c7db5f7c164c",
+        "type": "debug",
+        "z": "fa6a8c6129318283",
+        "name": "Send Msg",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1340,
+        "y": 720,
+        "wires": []
+    },
+    {
+        "id": "5585f1acb0a0f7f1",
+        "type": "rbe",
+        "z": "fa6a8c6129318283",
+        "name": "",
+        "func": "rbe",
+        "gap": "",
+        "start": "",
+        "inout": "out",
+        "septopics": true,
+        "property": "payload",
+        "topi": "topic",
+        "x": 1190,
+        "y": 600,
+        "wires": [
+            [
+                "22eb3c91573dff62",
+                "dd99c7db5f7c164c"
+            ]
+        ]
+    },
+    {
+        "id": "cad029c2d2ba9d48",
+        "type": "rbe",
+        "z": "fa6a8c6129318283",
+        "name": "",
+        "func": "rbe",
+        "gap": "",
+        "start": "",
+        "inout": "out",
+        "x": 1650,
+        "y": 540,
+        "wires": [
+            [
+                "6a8db6e2c77280da"
+            ]
+        ]
+    },
+    {
+        "id": "6a8db6e2c77280da",
+        "type": "function",
+        "z": "fa6a8c6129318283",
+        "name": "",
+        "func": "msg.payload=msg.payload.slice(0,3);\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1840,
+        "y": 560,
+        "wires": [
+            [
+                "5ecbf46a0846d8af"
+            ]
+        ]
+    },
+    {
+        "id": "5ecbf46a0846d8af",
+        "type": "ui_template",
+        "z": "fa6a8c6129318283",
+        "group": "78dd283e7faf6f13",
+        "name": "Heading",
+        "order": 13,
+        "width": "0",
+        "height": "0",
+        "format": "\n<md-button class=\"filled bigfont rounded\" style=\"background-image:linear-gradient(180deg, #2980b9, #392bc0)\"> \n    Tornado {{msg.payload}}<br/>\n</md-button> \n\n",
+        "storeOutMessages": true,
+        "fwdInMessages": true,
+        "resendOnRefresh": false,
+        "templateScope": "local",
+        "className": "",
+        "x": 2060,
+        "y": 560,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "f8ded012de76f9f5",
+        "type": "function",
+        "z": "fa6a8c6129318283",
+        "name": "Receveiv Rotator",
+        "func": "\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1590,
+        "y": 420,
+        "wires": [
+            [
+                "cad029c2d2ba9d48"
+            ]
+        ]
+    },
+    {
+        "id": "9bf2d91f23aba55a",
+        "type": "inject",
+        "z": "fa6a8c6129318283",
+        "name": "",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "1",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "",
+        "topic": "",
+        "payload": "AI1;",
+        "payloadType": "str",
+        "x": 1230,
+        "y": 380,
+        "wires": [
+            [
+                "22eb3c91573dff62"
+            ]
+        ]
+    },
+    {
+        "id": "78dd283e7faf6f13",
+        "type": "ui_group",
+        "name": "MOAS II Anan 7000",
+        "tab": "8f98f4ce.30eb48",
+        "order": 9,
+        "disp": true,
+        "width": "4",
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "8f98f4ce.30eb48",
+        "type": "ui_tab",
+        "name": "W7GES SO2R",
+        "icon": "dashboard",
+        "order": 1,
+        "disabled": false,
+        "hidden": false
+    }
+]
