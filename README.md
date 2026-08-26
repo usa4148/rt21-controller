@@ -36,6 +36,7 @@ Useful flags:
 | `--unit 2` | Use rotator digit 2 in every command (`AI2;`, `AP2xxx;`) |
 | `--listen 0.0.0.0` | Let phones/tablets on your LAN open the UI too |
 | `--http-port 8721` | Change the port the web UI itself listens on |
+| `--n1mm` | Accept rotator commands from N1MM Logger+ (see below) |
 | `--no-browser` | Don't auto-open a browser tab |
 | `--reset-config` | Ignore and rewrite the saved settings |
 | `-v` | Debug-level logging |
@@ -78,6 +79,30 @@ Settings can pin either. Note the GHE box buffers only the *last* reply, so
 polling floors at one second there. If the box's serial link to the RT-21
 dies (an unplugged USB cable, say), the stale-data watchdog notices the
 missing heading and flags the link instead of showing an empty compass.
+
+## N1MM Logger+ integration
+
+N1MM never speaks the RT-21 protocol itself — when you press **Alt+J** it
+broadcasts a small XML packet over UDP port 12040 and expects a separate
+"rotator program" to translate. Run this app with `--n1mm` (or set
+`"n1mm_enabled": true` in the config file) and it *is* that program:
+
+- Point N1MM at this machine: **Config → Configure Ports… → Broadcast
+  Data**, tick **Rotator** and set the address to `<this machine's
+  IP>:12040` (the default `127.0.0.1` only works if N1MM runs on the same
+  machine).
+- Alt+J / callsign-bearing turns go into the same command queue the web UI
+  uses, so the compass animates every slew N1MM commands. N1MM's `<offset>`
+  is honored and `<stop>` maps to the RT-21 stop sequence.
+- The live heading is reported back to the logger on UDP port 13010 in the
+  standard `rotorname @ tenths-of-degrees` form, so N1MM's bearing display
+  tracks the rotator.
+
+Because the RT-21 link has exactly one owner (this app), N1MM control works
+over the GHE bridge too — no fighting over the GHE box's one-reply buffer,
+which is what breaks running two rotator programs side by side. Note the
+UDP port accepts commands from any machine on the network while enabled,
+which is the point — but only enable it on a network you trust.
 
 ## Protocol corrections (inherited from 2.0)
 
@@ -138,6 +163,9 @@ stale-link watchdog, drop-and-reconnect, and clean thread shutdown:
 python3 test_web.py
 ```
 
-30 tests, ~30 s, no dependencies. Also verified live against the real RT-21
+The suite also emulates N1MM Logger+ over UDP to exercise the `--n1mm`
+bridge: turn and stop packets, offset handling, and the heading report.
+
+33 tests, ~33 s, no dependencies. Also verified live against the real RT-21
 (firmware 4.13.2) through its GH Everywhere interface: connect, poll, slew,
 motion status and return-to-heading all confirmed end to end.

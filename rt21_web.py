@@ -137,6 +137,8 @@ class Config:
     show_raw_traffic: bool = False
     presets: list[dict[str, Any]] = field(default_factory=lambda: list(DEFAULT_PRESETS))
     http_port: int = 8721               # where this script's own web UI listens
+    n1mm_enabled: bool = False          # accept rotator commands from N1MM Logger+
+    n1mm_port: int = 12040              # N1MM's fixed rotor broadcast port
 
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -169,6 +171,8 @@ class Config:
         self.reconnect_max_delay = _clampf(float(self.reconnect_max_delay), 1.0, 300.0)
         self.max_heading = _clamp(int(self.max_heading), 359, 719)
         self.http_port = _clamp(int(self.http_port or 8721), 1, 65535)
+        self.n1mm_enabled = bool(self.n1mm_enabled)
+        self.n1mm_port = _clamp(int(self.n1mm_port or 12040), 1, 65535)
         if self.transport not in ("auto", "tcp", "ghe"):
             self.transport = "auto"
         if not isinstance(self.presets, list):
@@ -845,6 +849,123 @@ class LinkManager:
     def protocol(self) -> Protocol:
         link = self._link
         return link.protocol if link is not None else Protocol(self._cfg.unit)
+
+
+# --------------------------------------------------------------------------- #
+# N1MM Logger+ bridge — this app acts as N1MM's "rotator program"
+# --------------------------------------------------------------------------- #
+class N1mmBridge(threading.Thread):
+    """Accepts rotator commands from N1MM Logger+ over UDP.
+
+    N1MM never speaks the RT-21 protocol itself: when the operator hits
+    Alt+J it broadcasts a small XML datagram on port 12040 (<goazi> to
+    turn, <stop> to stop) and expects a separate rotator program to
+    translate. This thread is that program. Commands feed the same queue
+    the web UI uses — the compass animates N1MM's slews — and the live
+    heading is reported back to the logger on port 13010 as
+    "rotorname @ tenths-of-degrees" (146° -> "mystack @ 1460").
+
+    The socket accepts datagrams from any machine on the network (that is
+    the point — N1MM runs on a Windows box elsewhere in the shack), so the
+    bridge is off unless --n1mm or the n1mm_enabled config key turns it on.
+    """
+
+    _GOAZI = re.compile(r"<goazi>\s*(-?[0-9]+(?:[.,][0-9]+)?)\s*</goazi>")
+    _OFFSET = re.compile(r"<offset>\s*(-?[0-9]+(?:[.,][0-9]+)?)\s*</offset>")
+    _NAME = re.compile(r"<rotorname>\s*(.*?)\s*</rotorname>", re.S)
+    _STOP = re.compile(r"<stop\b")
+
+    FEEDBACK_PERIOD = 2.0               # seconds between heading reports
+
+    def __init__(self, cfg: Config, hub: Hub, manager: LinkManager,
+                 feedback_port: int = 13010) -> None:
+        super().__init__(daemon=True, name="n1mm-bridge")
+        self._cfg = cfg
+        self._hub = hub
+        self._manager = manager
+        self._feedback_port = feedback_port
+        self._quit = threading.Event()
+        self._peer: Optional[str] = None    # IP of the N1MM we last heard from
+        self._rotor_name = ""               # echoed back in heading reports
+        self._last_feedback = 0.0
+        # Bind in the caller's thread so a taken port fails loudly at startup
+        # instead of silently inside a daemon thread.
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(("", cfg.n1mm_port))
+            self._sock.settimeout(0.5)
+        except OSError:
+            self._sock.close()
+            raise
+        self.port = self._sock.getsockname()[1]
+
+    def shutdown(self, timeout: float = 2.0) -> None:
+        self._quit.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self.join(timeout)
+
+    def run(self) -> None:
+        LOG.info("N1MM bridge: listening on UDP port %d (any machine on the "
+                 "network can turn the rotator); heading reports go to port %d",
+                 self.port, self._feedback_port)
+        while not self._quit.is_set():
+            try:
+                data, addr = self._sock.recvfrom(2048)
+            except socket.timeout:
+                pass
+            except OSError:
+                break                       # socket closed by shutdown()
+            else:
+                self._handle(data, addr[0])
+            self._send_feedback()
+        LOG.info("N1MM bridge stopped")
+
+    def _handle(self, data: bytes, sender: str) -> None:
+        text = data.decode("utf-8", "replace")
+        self._peer = sender
+        match = self._NAME.search(text)
+        if match:
+            self._rotor_name = match.group(1)[:32]
+        if self._STOP.search(text):
+            ok = self._manager.submit(self._manager.protocol().stop())
+            if ok:
+                self._hub.publish("target", {"deg": None})
+            LOG.info("N1MM: stop%s", "" if ok else " (rotator not connected — ignored)")
+            return
+        match = self._GOAZI.search(text)
+        if match is None:
+            LOG.debug("N1MM: unrecognized datagram from %s: %r", sender, text[:120])
+            return
+        azimuth = float(match.group(1).replace(",", "."))
+        offmatch = self._OFFSET.search(text)
+        offset = float(offmatch.group(1).replace(",", ".")) if offmatch else 0.0
+        heading = round(azimuth + offset) % 360
+        proto = self._manager.protocol()
+        ok = self._manager.submit([proto.goto(heading), proto.move_to_target()])
+        if ok:
+            self._hub.publish("target", {"deg": heading})
+        LOG.info("N1MM: turn to %03d°%s", heading,
+                 "" if ok else " (rotator not connected — ignored)")
+        self._last_feedback = 0.0           # answer with a heading right away
+
+    def _send_feedback(self) -> None:
+        now = time.monotonic()
+        if self._peer is None or now - self._last_feedback < self.FEEDBACK_PERIOD:
+            return
+        heading = self._hub.state["heading"]    # single-value read; a stale
+        if heading is None:                     # snapshot is harmless here
+            return
+        message = f"{self._rotor_name or 'rotor'} @ {int(round(float(heading) * 10))}"
+        try:
+            self._sock.sendto(message.encode("ascii", "replace"),
+                              (self._peer, self._feedback_port))
+            self._last_feedback = now
+        except OSError:
+            pass                            # feedback is best-effort
 
 
 # --------------------------------------------------------------------------- #
@@ -1711,6 +1832,9 @@ def parse_args(argv: "Optional[list[str]]" = None) -> argparse.Namespace:
                     help="address the web UI binds to (default 127.0.0.1; "
                          "use 0.0.0.0 to reach it from other devices)")
     ap.add_argument("--http-port", type=int, help="web UI port (default from config, 8721)")
+    ap.add_argument("--n1mm", action="store_true",
+                    help="accept rotator commands from N1MM Logger+ "
+                         "(UDP port 12040, heading reports on 13010)")
     ap.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
     ap.add_argument("--reset-config", action="store_true", help="start from factory settings")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
@@ -1737,6 +1861,8 @@ def main(argv: "Optional[list[str]]" = None) -> int:
         cfg.unit = args.unit
     if args.http_port:
         cfg.http_port = args.http_port
+    if args.n1mm:
+        cfg.n1mm_enabled = True
     cfg.sanitize()
 
     sim: Optional[Rt21Simulator] = None
@@ -1753,6 +1879,15 @@ def main(argv: "Optional[list[str]]" = None) -> int:
     hub = Hub()
     LOG.addHandler(HubLogHandler(hub))
     manager = LinkManager(cfg, hub)
+
+    bridge: Optional[N1mmBridge] = None
+    if cfg.n1mm_enabled:
+        try:
+            bridge = N1mmBridge(cfg, hub, manager)
+            bridge.start()
+        except OSError as exc:
+            LOG.error("N1MM bridge disabled — cannot bind UDP port %d: %s",
+                      cfg.n1mm_port, exc)
 
     Handler.ctx = AppContext(cfg, hub, manager)
     try:
@@ -1780,6 +1915,8 @@ def main(argv: "Optional[list[str]]" = None) -> int:
         LOG.info("Interrupted — shutting down")
     finally:
         httpd.server_close()
+        if bridge is not None:
+            bridge.shutdown()
         manager.disconnect()
         if sim is not None:
             sim.shutdown()

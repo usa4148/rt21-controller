@@ -10,6 +10,7 @@ no third-party packages.
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import time
 import unittest
@@ -24,6 +25,7 @@ from rt21_web import (
     Hub,
     LinkManager,
     LinkState,
+    N1mmBridge,
     Protocol,
     RotatorLink,
     Rt21Simulator,
@@ -501,6 +503,82 @@ class WatchdogTests(unittest.TestCase):
                     conn.close()
                 except OSError:
                     pass
+
+
+# --------------------------------------------------------------------------- #
+class N1mmBridgeTests(unittest.TestCase):
+    """The N1MM UDP bridge against the simulator: turn, stop, heading report."""
+
+    # What N1MM Logger+ actually broadcasts on port 12040 (Alt+J).
+    TURN = ("<N1MMRotor><rotor><rotorname>teststack</rotorname>"
+            "<goazi>45.0</goazi><offset>0.0</offset>"
+            "<bidirectional>0</bidirectional><freqband>14.0</freqband>"
+            "</rotor></N1MMRotor>")
+    STOP = ("<N1MMRotor><rotor><rotorname>teststack</rotorname>"
+            "<stop></stop><freqband>14.0</freqband></rotor></N1MMRotor>")
+
+    def setUp(self) -> None:
+        self.sim = Rt21Simulator(speed=400.0)
+        self.sim.start()
+        self.cfg = Config(host="127.0.0.1", port=self.sim.port,
+                          poll_interval=0.2, stale_timeout=3.0,
+                          n1mm_enabled=True, n1mm_port=0)  # 0 = ephemeral port
+        self.cfg.transport = "tcp"
+        self.hub = Hub()
+        self.manager = LinkManager(self.cfg, self.hub)
+        # A plain UDP socket plays the part of N1MM; the bridge's heading
+        # reports are steered to this socket's own port instead of 13010.
+        self.n1mm = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.n1mm.bind(("127.0.0.1", 0))
+        self.n1mm.settimeout(6.0)
+        self.bridge = N1mmBridge(self.cfg, self.hub, self.manager,
+                                 feedback_port=self.n1mm.getsockname()[1])
+        self.bridge.start()
+
+    def tearDown(self) -> None:
+        self.bridge.shutdown()
+        self.manager.disconnect()
+        self.sim.shutdown()
+        self.n1mm.close()
+
+    def _send(self, xml: str) -> None:
+        self.n1mm.sendto(xml.encode(), ("127.0.0.1", self.bridge.port))
+
+    def test_turn_stop_and_heading_report(self) -> None:
+        self.manager.connect()
+        self.assertTrue(wait_for(lambda: self.manager.link.connected),
+                        "never connected")
+        self._send(self.TURN)
+        self.assertTrue(wait_for(lambda: self.hub.state["target"] == 45),
+                        "goazi packet never became a target")
+        self.assertTrue(
+            wait_for(lambda: (self.hub.state["heading"] or 0) > 20, timeout=6.0),
+            "rotator never moved toward N1MM's heading",
+        )
+        reply, _ = self.n1mm.recvfrom(256)
+        name, _, tenths = reply.decode().partition(" @ ")
+        self.assertEqual(name, "teststack")
+        self.assertTrue(tenths.isdigit(), f"bad heading report: {reply!r}")
+        self._send(self.STOP)
+        self.assertTrue(wait_for(lambda: self.hub.state["target"] is None),
+                        "stop packet never cleared the target")
+
+    def test_offset_and_comma_decimals_apply(self) -> None:
+        self.manager.connect()
+        self.assertTrue(wait_for(lambda: self.manager.link.connected))
+        packet = self.TURN.replace("45.0", "350,0").replace(">0.0</offset>",
+                                                            ">20,0</offset>")
+        self._send(packet)
+        self.assertTrue(wait_for(lambda: self.hub.state["target"] == 10),
+                        "350 + 20 offset should wrap to a 010 target")
+
+    def test_garbage_and_disconnected_are_harmless(self) -> None:
+        # No rotator connected: packets must be ignored, not crash the thread
+        self._send("not xml at all \x00\xff")
+        self._send(self.TURN)
+        time.sleep(0.3)
+        self.assertIsNone(self.hub.state["target"])
+        self.assertTrue(self.bridge.is_alive())
 
 
 if __name__ == "__main__":
