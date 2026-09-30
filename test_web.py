@@ -661,6 +661,7 @@ class MotionDirectorTests(unittest.TestCase):
         self.assertEqual(self.d.take(self.p, True), [])
 
     def test_min_interval_delays_but_keeps_latest(self) -> None:
+        self.cfg.retarget_mode = "direct"
         self.cfg.retarget_min_interval = 0.3
         self.d.goto(10, "web")
         self.assertTrue(self.d.take(self.p, False))
@@ -676,18 +677,76 @@ class MotionDirectorTests(unittest.TestCase):
         self.d.stop("web")
         self.assertEqual(self.d.take(self.p, True), [";", "ST1;"])
 
-    def test_stop_first_mode(self) -> None:
+    def test_stop_first_waits_for_stopped_then_settle(self) -> None:
         self.cfg.retarget_mode = "stop_first"
         self.cfg.retarget_settle_ms = 200
-        self.d.goto(10, "web")
+        self.d.goto(90, "hamlib")
         self.d.take(self.p, False)
-        self.d.goto(200, "n1mm")
+        self.d.goto(0, "hamlib")                   # reversal mid-move
         self.assertEqual(self.d.take(self.p, True), [";", "ST1;"])
-        self.assertEqual(self.d.take(self.p, True), [], "still settling")
+        time.sleep(0.3)
+        self.assertEqual(self.d.take(self.p, True), [], "still turning: must wait")
+        self.assertEqual(self.d.take(self.p, False), [], "just stopped: DELAYS not over")
         time.sleep(0.25)
+        self.assertEqual(self.d.take(self.p, False), ["AP1000\r;", "AM1;"])
+
+    def test_stop_first_counts_a_fresh_goto_as_moving(self) -> None:
+        # Over GHE the status poll lags; a goto sent a moment ago is in motion
+        self.cfg.retarget_mode = "stop_first"
+        self.d.goto(90, "hamlib")
+        self.d.take(self.p, False)
+        self.d.goto(0, "hamlib")
+        self.assertEqual(self.d.take(self.p, False), [";", "ST1;"])
+
+    def test_stop_first_timeout_sends_anyway(self) -> None:
+        self.cfg.retarget_mode = "stop_first"
+        self.d.STOP_TIMEOUT = 0.2
+        self.d.goto(90, "web")
+        self.d.take(self.p, False)
+        self.d.goto(0, "web")
+        self.d.take(self.p, True)
+        time.sleep(0.25)
+        self.assertEqual(self.d.take(self.p, True), ["AP1000\r;", "AM1;"])
+
+    def test_explicit_stop_then_goto_waits_for_delays(self) -> None:
+        self.cfg.retarget_settle_ms = 200
+        self.d.goto(90, "n1mm")
+        self.d.take(self.p, False)
+        self.d.stop("n1mm")
+        self.assertEqual(self.d.take(self.p, True), [";", "ST1;"])
+        self.d.goto(0, "n1mm")
+        self.assertEqual(self.d.take(self.p, False), [])
+        time.sleep(0.25)
+        self.assertEqual(self.d.take(self.p, False), ["AP1000\r;", "AM1;"])
+
+    def test_stop_while_idle_does_not_delay_next_goto(self) -> None:
+        self.d.stop("web")
+        self.d.take(self.p, False)
+        self.d.goto(45, "web")
+        self.assertEqual(self.d.take(self.p, False), ["AP1045\r;", "AM1;"])
+
+    def test_goto_that_never_moves_is_resent_once(self) -> None:
+        self.d.VERIFY_AFTER = 0.1
+        self.hub.publish("heading", {"deg": 10.0})
+        self.d.goto(200, "hamlib")
+        self.d.take(self.p, False)
+        time.sleep(0.15)
         self.assertEqual(self.d.take(self.p, False), ["AP1200\r;", "AM1;"])
+        time.sleep(0.15)
+        self.assertEqual(self.d.take(self.p, False), [], "only one retry")
+
+    def test_goto_that_moved_is_not_resent(self) -> None:
+        self.d.VERIFY_AFTER = 0.1
+        self.hub.publish("heading", {"deg": 10.0})
+        self.d.goto(200, "hamlib")
+        self.d.take(self.p, False)
+        self.hub.publish("heading", {"deg": 20.0})
+        self.d.take(self.p, False)
+        time.sleep(0.15)
+        self.assertEqual(self.d.take(self.p, False), [])
 
     def test_direct_mode_retargets_while_moving(self) -> None:
+        self.cfg.retarget_mode = "direct"
         self.d.goto(10, "web")
         self.d.take(self.p, False)
         self.d.goto(200, "n1mm")
@@ -1041,7 +1100,7 @@ class ConfigListenerTests(unittest.TestCase):
         self.assertEqual(cfg.hamlib_bind, "0.0.0.0")
         self.assertEqual(cfg.pst_bind, "127.0.0.1")
         self.assertIsNone(cfg.park_heading)
-        self.assertEqual(cfg.retarget_mode, "direct")
+        self.assertEqual(cfg.retarget_mode, "stop_first")
         self.assertEqual(cfg.hamlib_max_clients, 32)
         self.assertEqual(cfg.pst_port, 65534, "leaves room for the reply port")
 

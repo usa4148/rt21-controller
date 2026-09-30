@@ -142,9 +142,15 @@ goes out first; a burst of retargets reaches the controller as one command.
 The readout shows who set the current target (`→ 245° · N1MM`) and the log
 records every change (`Target 245° from N1MM (was 090° from Hamlib)`).
 
-`retarget_mode` controls a retarget during a move: `direct` (default) sends
-the new target straight away; `stop_first` stops, waits
-`retarget_settle_ms`, then turns.
+The RT-21 ignores a new target that arrives while its motor is running, and
+enforces its DELAYS setting (1–6 s, default 3) before it will reverse. So a
+retarget during a move (`retarget_mode: stop_first`, the default) sends a
+stop, waits for the controller to report "stopped", waits
+`retarget_settle_ms` more (default 3.5 s — set it at or above your DELAYS),
+then turns. The same wait applies when any program sends a stop and then a
+new target straight away. A target that produces no motion within 6 s is
+re-sent once. `direct` sends the new target immediately, for controllers
+that accept it mid-move.
 
 `park_heading` is unset by default, so park requests are refused
 (Hamlib `K` returns `RPRT -11`). Set it in the settings dialog to enable
@@ -219,7 +225,7 @@ real sockets: latest-command-wins overrides between sources, burst
 coalescing, stop priority, the Hamlib client cap and malformed input, the
 PstRotator reply port, listener restarts, and clean shutdown.
 
-74 tests, ~45 s, no dependencies; passes on Python 3.9 through 3.14. The
+80 tests, ~50 s, no dependencies; passes on Python 3.9 through 3.14. The
 Hamlib server was also checked with Hamlib 4.5.5's own `rotctl -m 2`. Also verified live against the real RT-21
 (firmware 4.13.2) through its GH Everywhere interface: connect, poll, slew,
 motion status and return-to-heading all confirmed end to end.

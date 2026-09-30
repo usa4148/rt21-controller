@@ -191,10 +191,16 @@ tested.
   `\dump_state` follows Hamlib 4.5+ (`key=value` lines ending in `done`),
   which `rotctl -m 2` (Hamlib 4.5.5) accepts.
 - **Version** bumped to 3.1.0.
+- **Mid-move retarget (live test, 2026-09-29):** `direct` failed on the real
+  RT-21 — `P 90` then `P 0` kept turning to 90. The RT-21 ignores a target
+  sent while the motor runs and enforces DELAYS (default 3 s) before a
+  reversal. `stop_first` is now the default: stop, wait for "stopped"
+  status, wait `retarget_settle_ms` (3.5 s), then turn; any stop-then-goto
+  gets the same wait; a goto that produces no motion is re-sent once.
 
 # 8. Status
 
-- 74 automated tests pass on Python 3.9, 3.10, 3.11, 3.12, 3.13 and 3.14.
+- 80 automated tests pass on Python 3.9, 3.10, 3.11, 3.12, 3.13 and 3.14.
 - Checked with real Hamlib 4.5.5 `rotctl -m 2` and PstRotator-format UDP
   against `--demo`.
 - **Still to do on real hardware** (section 5, live): N1MM Alt+J and stop

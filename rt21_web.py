@@ -163,8 +163,9 @@ class Config:
     pst_bind: str = "0.0.0.0"
     pst_port: int = 12000               # replies go to the sender on port + 1
     park_heading: Optional[int] = None  # None = park disabled
-    retarget_mode: str = "direct"       # direct | stop_first (mid-move retarget)
-    retarget_settle_ms: int = 800       # stop_first: pause between stop and goto
+    retarget_mode: str = "stop_first"   # stop_first | direct (mid-move retarget)
+    retarget_settle_ms: int = 3500      # wait after the rotor stops before turning again;
+                                        # must cover the RT-21's DELAYS setting (default 3 s)
     retarget_min_interval: float = 0.3  # seconds between gotos on the wire
 
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -216,8 +217,8 @@ class Config:
             except (TypeError, ValueError):
                 self.park_heading = None
         if self.retarget_mode not in ("direct", "stop_first"):
-            self.retarget_mode = "direct"
-        self.retarget_settle_ms = _clamp(int(self.retarget_settle_ms), 0, 5000)
+            self.retarget_mode = "stop_first"
+        self.retarget_settle_ms = _clamp(int(self.retarget_settle_ms), 0, 10000)
         self.retarget_min_interval = _clampf(float(self.retarget_min_interval), 0.0, 5.0)
         if self.transport not in ("auto", "tcp", "ghe"):
             self.transport = "auto"
@@ -940,6 +941,7 @@ class Motion:
     heading: Optional[int] = None       # goto: wire heading (may exceed 359 on overlap)
     direction: str = ""                 # jog: cw | ccw
     stopped_first: bool = False         # stop_first retarget: stop already sent
+    retried: bool = False               # goto re-sent once because nothing moved
 
 
 class MotionDirector:
@@ -955,6 +957,17 @@ class MotionDirector:
     SOURCE_LABELS = {"web": "web UI", "n1mm": "N1MM", "hamlib": "Hamlib",
                      "pst": "PstRotator"}
     DUPLICATE_WINDOW = 2.0              # seconds a repeat of the active goto is dropped
+    RECENT_MOTION = 3.0                 # a goto this recent counts as "moving"
+                                        # (status polls over GHE lag ~2 s)
+    STOP_TIMEOUT = 20.0                 # give up waiting for "stopped" after this
+    VERIFY_AFTER = 6.0                  # re-send a goto once if nothing moved by then
+
+    # The RT-21 enforces its DELAYS setting (1-6 s, default 3) before it will
+    # reverse the motor, and ignores a new target that arrives while the motor
+    # is running or inside that delay. So a goto that follows a stop of a
+    # moving rotor waits until the controller reports "stopped", then
+    # retarget_settle_ms more, and a goto that produced no motion at all is
+    # re-sent once.
 
     def __init__(self, cfg: Config, hub: Hub, manager: "LinkManager") -> None:
         self._cfg = cfg
@@ -964,7 +977,10 @@ class MotionDirector:
         self._pending: Optional[Motion] = None
         self._active: Optional[Motion] = None   # last goto put on the wire
         self._active_at = 0.0
-        self._settle_until = 0.0
+        self._stop_at = 0.0                     # when a stop of a moving rotor went out
+        self._stopped_at = 0.0                  # when the controller then reported stopped
+        self._saw_motion = False                # active goto produced motion?
+        self._heading_at_send: Optional[float] = None
 
     # -- called from any source thread -------------------------------------- #
     def goto(self, heading: int, source: str) -> bool:
@@ -996,8 +1012,7 @@ class MotionDirector:
         if not self._manager.connected:
             return False
         with self._lock:
-            self._pending = Motion("stop", source)
-            self._active = None
+            self._pending = Motion("stop", source)  # take() retires the active goto
         self._hub.publish("target", {"deg": None, "source": source})
         LOG.info("Stop from %s", self._label(source))
         return True
@@ -1022,40 +1037,96 @@ class MotionDirector:
         """Return the wire commands for the pending request, if it is due."""
         now = time.monotonic()
         with self._lock:
+            if self._active is not None and not self._saw_motion:
+                heading = self._hub.get("heading")
+                if moving or (heading is not None and self._heading_at_send is not None
+                              and abs(_shortest_delta(self._heading_at_send,
+                                                      float(heading))) > 2):
+                    self._saw_motion = True
+            if self._stop_at and not moving and not self._stopped_at:
+                self._stopped_at = now          # first "stopped" status after the stop
             motion = self._pending
             if motion is None:
-                return []
+                return self._verify(proto, moving, now)
             if motion.kind == "stop":
                 self._pending = None
-                self._settle_until = 0.0
+                self._note_stop(moving, now)
                 return proto.stop()
             if motion.kind == "jog":
                 self._pending = None
+                self._stop_at = self._stopped_at = 0.0
                 return [proto.jog_cw() if motion.direction == "cw" else proto.jog_ccw()]
             # goto
-            if now < self._settle_until:
-                return []
             if now - self._active_at < self._cfg.retarget_min_interval:
                 return []
-            if (self._cfg.retarget_mode == "stop_first" and moving
-                    and not motion.stopped_first and self._active is not None):
+            if (self._cfg.retarget_mode == "stop_first" and not motion.stopped_first
+                    and self._in_motion(moving, now)):
                 motion.stopped_first = True
-                self._settle_until = now + self._cfg.retarget_settle_ms / 1000.0
+                self._note_stop(True, now)
+                LOG.info("Retarget while turning: stopping first, then %03d°",
+                         (motion.heading or 0) % 360)
                 return proto.stop()
+            if not self._settled(now):
+                return []
             self._pending = None
-            self._active = motion
-            self._active_at = now
-            assert motion.heading is not None
-            # AP1xxx<CR>; slews on its own; AM1; after it is harmless and covers
-            # firmware that treats the AP form as target-only.
-            return [proto.goto(motion.heading), proto.move_to_target()]
+            self._stop_at = self._stopped_at = 0.0
+            return self._send_goto(proto, motion, now)
+
+    def _in_motion(self, moving: bool, now: float) -> bool:
+        return self._active is not None and (
+            moving or now - self._active_at < self.RECENT_MOTION)
+
+    def _note_stop(self, moving: bool, now: float) -> None:
+        """A stop is going out; remember it if the rotor may be turning."""
+        if self._in_motion(moving, now) or moving:
+            self._stop_at, self._stopped_at = now, 0.0
+        self._active = None
+
+    def _settled(self, now: float) -> bool:
+        """True once a stopped rotor has sat out the controller's DELAYS."""
+        if not self._stop_at:
+            return True
+        if now - self._stop_at > self.STOP_TIMEOUT:
+            LOG.warning("Controller never reported stopped; sending the new target anyway")
+            return True
+        if not self._stopped_at:
+            return False
+        return now - self._stopped_at >= self._cfg.retarget_settle_ms / 1000.0
+
+    def _send_goto(self, proto: Protocol, motion: Motion, now: float) -> list[str]:
+        self._active = motion
+        self._active_at = now
+        self._saw_motion = False
+        heading = self._hub.get("heading")
+        self._heading_at_send = None if heading is None else float(heading)
+        assert motion.heading is not None
+        # AP1xxx<CR>; slews on its own; AM1; after it is harmless and covers
+        # firmware that treats the AP form as target-only.
+        return [proto.goto(motion.heading), proto.move_to_target()]
+
+    def _verify(self, proto: Protocol, moving: bool, now: float) -> list[str]:
+        """Re-send the active goto once if the rotor never started moving."""
+        active = self._active
+        if (active is None or active.retried or self._saw_motion or moving
+                or now - self._active_at < self.VERIFY_AFTER):
+            return []
+        heading = self._hub.get("heading")
+        if heading is None or abs(_shortest_delta(float(heading),
+                                                  float((active.heading or 0) % 360))) <= 3:
+            active.retried = True               # already there; nothing to do
+            return []
+        active.retried = True
+        LOG.warning("Rotator did not start toward %03d°; re-sending the target",
+                    (active.heading or 0) % 360)
+        self._active_at = now
+        return [proto.goto(active.heading or 0), proto.move_to_target()]
 
     def discard(self) -> None:
         """Drop anything pending (the link reconnected; it is stale)."""
         with self._lock:
             self._pending = None
             self._active = None
-            self._settle_until = 0.0
+            self._stop_at = self._stopped_at = 0.0
 
     def _label(self, source: Optional[str]) -> str:
         return self.SOURCE_LABELS.get(source or "", source or "unknown")
@@ -1860,6 +1931,7 @@ class Handler(BaseHTTPRequestHandler):
                 "pst_port": cfg.pst_port,
                 "park_heading": cfg.park_heading,
                 "retarget_mode": cfg.retarget_mode,
+                "retarget_settle_ms": cfg.retarget_settle_ms,
             },
             "app": {"name": APP_NAME, "version": APP_VERSION},
         }
@@ -1947,6 +2019,7 @@ class Handler(BaseHTTPRequestHandler):
             "poll_interval": float, "auto_reconnect": bool, "transport": str,
             "n1mm_enabled": bool, "hamlib_enabled": bool, "hamlib_port": int,
             "pst_enabled": bool, "pst_port": int, "retarget_mode": str,
+            "retarget_settle_ms": int,
             "park_heading": lambda v: None if v in (None, "") else int(v),
         }
         changed = []
@@ -2191,9 +2264,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <input type="number" id="setPstPort" min="1" max="65534" style="width:90px"></span>
     <label>Park heading</label><input type="number" id="setPark" min="0" max="719" placeholder="off">
     <label>Retarget mid-move</label><select id="setRetarget">
-      <option value="direct">Send new target directly</option>
       <option value="stop_first">Stop, then turn</option>
+      <option value="direct">Send new target directly</option>
     </select>
+    <label>Wait after stop (s)</label><input type="number" id="setSettle" min="0" max="10" step="0.5">
+    <div class="hint">Match or exceed the RT-21's DELAYS setting (default 3 s) plus a margin.</div>
     <textarea id="setPresets" spellcheck="false"></textarea>
     <div class="hint">Beam headings, one per line: <b>name, degrees</b> (e.g. <code>EU, 30</code>)</div>
   </div>
@@ -2527,7 +2602,8 @@ $("settingsBtn").onclick = () => {
   $("setHamlib").checked = !!S.cfg.hamlib_enabled; $("setHamlibPort").value = S.cfg.hamlib_port;
   $("setPst").checked = !!S.cfg.pst_enabled; $("setPstPort").value = S.cfg.pst_port;
   $("setPark").value = S.cfg.park_heading == null ? "" : S.cfg.park_heading;
-  $("setRetarget").value = S.cfg.retarget_mode || "direct";
+  $("setRetarget").value = S.cfg.retarget_mode || "stop_first";
+  $("setSettle").value = (S.cfg.retarget_settle_ms ?? 3500) / 1000;
   $("setPresets").value = S.cfg.presets.map(p => p.name + ", " + p.heading).join("\n");
   $("settingsDlg").showModal();
 };
@@ -2551,6 +2627,7 @@ $("setSave").onclick = async () => {
     pst_port: parseInt($("setPstPort").value, 10) || 12000,
     park_heading: $("setPark").value.trim() === "" ? null : parseInt($("setPark").value, 10),
     retarget_mode: $("setRetarget").value,
+    retarget_settle_ms: Math.round((parseFloat($("setSettle").value) || 0) * 1000),
     presets,
   });
   if (ok) $("settingsDlg").close();
