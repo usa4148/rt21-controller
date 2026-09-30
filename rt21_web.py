@@ -920,11 +920,11 @@ class N1mmBridge(threading.Thread):
             except OSError:
                 break                       # socket closed by shutdown()
             else:
-                self._handle(data, addr[0])
+                self._on_datagram(data, addr[0])
             self._send_feedback()
         LOG.info("N1MM bridge stopped")
 
-    def _handle(self, data: bytes, sender: str) -> None:
+    def _on_datagram(self, data: bytes, sender: str) -> None:
         text = data.decode("utf-8", "replace")
         self._peer = sender
         match = self._NAME.search(text)
@@ -984,11 +984,11 @@ class Rt21Simulator(threading.Thread):
         self._speed = speed
         self._heading = 0.0
         self._target = 0.0
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self._clients: list[socket.socket] = []
 
     def shutdown(self) -> None:
-        self._stop.set()
+        self._halt.set()
         for client in list(self._clients):
             try:
                 client.shutdown(socket.SHUT_RDWR)
@@ -1005,7 +1005,7 @@ class Rt21Simulator(threading.Thread):
             pass
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 conn, _ = self._server.accept()
             except OSError:
@@ -1018,7 +1018,7 @@ class Rt21Simulator(threading.Thread):
         buffer = ""
         last = time.monotonic()
         with conn:
-            while not self._stop.is_set():
+            while not self._halt.is_set():
                 now = time.monotonic()
                 self._advance(now - last)
                 last = now
@@ -1033,7 +1033,7 @@ class Rt21Simulator(threading.Thread):
                     return
                 while ";" in buffer:
                     frame, buffer = buffer.split(";", 1)
-                    reply = self._handle(frame.strip("\r\n "))
+                    reply = self._reply(frame.strip("\r\n "))
                     if reply:
                         try:
                             conn.sendall(reply.encode("ascii"))
@@ -1048,7 +1048,7 @@ class Rt21Simulator(threading.Thread):
         step = min(abs(delta), self._speed * elapsed)
         self._heading = (self._heading + step * (1 if delta > 0 else -1)) % 360.0
 
-    def _handle(self, frame: str) -> str:
+    def _reply(self, frame: str) -> str:
         moving = abs(_shortest_delta(self._heading, self._target)) >= 0.5
         if frame == "":
             self._target = self._heading
