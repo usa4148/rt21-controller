@@ -203,6 +203,9 @@ tested.
 - 80 automated tests pass on Python 3.9, 3.10, 3.11, 3.12, 3.13 and 3.14.
 - Checked with real Hamlib 4.5.5 `rotctl -m 2` and PstRotator-format UDP
   against `--demo`.
-- **Still to do on real hardware** (section 5, live): N1MM Alt+J and stop
-  from the Windows box, mid-move retarget on firmware 4.13.2 (switch to
-  `stop_first` if `direct` misbehaves), two sources at once.
+- **Live hardware (RT-21 via GHE, 2026-09-29) — all passed:**
+  - N1MM Logger+ targeting from the Windows box, heading reported back
+    under the N1MM rotor name.
+  - Hamlib `rotctl -m 2` from the Mac and from Linux.
+  - Mid-move reversal (`P 90` then `P 0`) with `stop_first`.
+  - N1MM and Hamlib steering at the same time: latest command wins.
