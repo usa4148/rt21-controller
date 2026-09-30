@@ -21,7 +21,8 @@ cd ~/Documents/HAM/GreenHeron
 ./run_rt21.sh                 # starts the app and opens the UI in your browser
 ```
 
-Windows: double-click `run_rt21.bat`. Or on any OS, just:
+The same launcher works on Linux. Windows: double-click `run_rt21.bat`.
+Or on any OS, just:
 
 ```sh
 python3 rt21_web.py
@@ -119,6 +120,26 @@ rotctl -m 2 -r 127.0.0.1:4533 P 245 0     # turn to 245°
 rotctl -m 2 -r 127.0.0.1:4533 p           # read the heading
 rotctl -m 2 -r 127.0.0.1:4533 S           # stop
 ```
+
+### Steering from Linux (or another Mac)
+
+The Hamlib server works from any machine on the network — tested with
+`rotctl` on Linux and macOS against the real RT-21. Install Hamlib's
+command-line tools, then point `rotctl` at the machine running this app:
+
+```sh
+sudo apt install libhamlib-utils     # Debian / Ubuntu / Raspberry Pi OS
+sudo dnf install hamlib              # Fedora
+brew install hamlib                  # macOS
+
+rotctl -m 2 -r 192.168.1.50:4533 P 90 0   # the IP of the machine running the app
+rotctl -m 2 -r 192.168.1.50:4533 p
+```
+
+Linux programs built on Hamlib (GPredict, for example) connect the same way:
+choose the network rotator (`NET rotctl`, model 2) with the app host's IP
+and port 4533. The app itself also runs on Linux, headless with
+`--no-browser`, and its test suite passes there.
 
 Supported: `P`/`\set_pos`, `p`/`\get_pos`, `S`/`\stop`, `K`/`\park`,
 `M`/`\move` (CW/CCW, mapped to the RT-21's 1.5 s jog), `_`/`\get_info`,
