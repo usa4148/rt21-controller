@@ -16,19 +16,52 @@ and hardened networking core and replaces the GUI toolkit with your browser.
 
 ## Running it
 
+Python 3.9 or newer is the only requirement. There is nothing to install.
+
+### macOS
+
 ```sh
 cd ~/Documents/HAM/GreenHeron
 ./run_rt21.sh                 # starts the app and opens the UI in your browser
 ```
 
-The same launcher works on Linux. Windows: double-click `run_rt21.bat`.
-Or on any OS, just:
+The first time a listener is enabled (`--n1mm`, `--hamlib`, `--pst`), macOS
+asks whether Python may accept incoming network connections — allow it, or
+other machines can't reach the rotator.
+
+### Linux
 
 ```sh
-python3 rt21_web.py
+cd ~/rt21-controller          # wherever you cloned the repo
+./run_rt21.sh                 # same launcher as macOS; picks the newest python3
+./run_rt21.sh --no-browser    # headless (server, Raspberry Pi, SSH session)
 ```
 
-Useful flags:
+Headless, open the UI from another machine with `--listen 0.0.0.0` and
+browse to `http://<this machine>:8721/`. If a firewall is running, open the
+ports you enable, e.g. with `ufw`:
+
+```sh
+sudo ufw allow 8721/tcp       # web UI (only with --listen 0.0.0.0)
+sudo ufw allow 4533/tcp       # Hamlib
+sudo ufw allow 12040/udp      # N1MM
+sudo ufw allow 12000/udp      # PstRotator
+```
+
+### Windows
+
+Double-click `run_rt21.bat`, or from a command prompt in the repo folder:
+
+```bat
+py -3 rt21_web.py
+py -3 rt21_web.py --no-browser --n1mm --hamlib
+```
+
+Install Python from python.org if `py` isn't found. When a listener is
+enabled, Windows Defender Firewall asks whether Python may communicate on
+networks — allow **Private networks**, or N1MM on another PC can't reach it.
+
+### Useful flags (all systems)
 
 | Flag | Effect |
 | --- | --- |
@@ -215,17 +248,38 @@ state.
   plus same-origin checks on every command the UI sends.
 - **The UI cannot take the app down.** Close the browser, open five tabs,
   refresh mid-slew — the worker thread neither knows nor cares.
-- **Clean shutdown** on Ctrl-C: HTTP server closed, worker joined, simulator
-  stopped.
+- **Clean shutdown** on Ctrl-C or SIGTERM (systemd, launchd, `kill`): HTTP
+  server closed, listeners and worker joined, simulator stopped.
 
 ## Where things live
 
-| | macOS |
+**macOS**
+
+| | Path |
 | --- | --- |
 | Settings | `~/Library/Preferences/GreenHeron/RT-21 Controller/config.json` |
 | Logs | `~/Library/Application Support/GreenHeron/RT-21 Controller/logs/rt21.log` |
 
-Windows uses `%APPDATA%` / `%LOCALAPPDATA%`, Linux `~/.config` / `~/.local/share`.
+**Linux**
+
+| | Path |
+| --- | --- |
+| Settings | `~/.config/GreenHeron/RT-21 Controller/config.json` |
+| Logs | `~/.local/share/GreenHeron/RT-21 Controller/logs/rt21.log` |
+
+`$XDG_CONFIG_HOME` and `$XDG_DATA_HOME` replace `~/.config` and
+`~/.local/share` when set.
+
+**Windows**
+
+| | Path |
+| --- | --- |
+| Settings | `%APPDATA%\GreenHeron\RT-21 Controller\config.json` |
+| Logs | `%LOCALAPPDATA%\GreenHeron\RT-21 Controller\logs\rt21.log` |
+
+`%APPDATA%` is usually `C:\Users\<you>\AppData\Roaming` and
+`%LOCALAPPDATA%` is `C:\Users\<you>\AppData\Local`.
+
 The config file is shared with the 2.0 client; keys the web edition does not
 use are preserved. Logs rotate at 1 MB, five files kept.
 
