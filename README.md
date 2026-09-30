@@ -1,4 +1,4 @@
-# RT-21 Rotator Controller 3.0 — web edition
+# RT-21 Rotator Controller 3.1 — web edition
 
 A durable, cross-platform client for the Green Heron Engineering RT-21
 rotator controller over its network (TCP) port. One Python file, **standard
@@ -37,6 +37,8 @@ Useful flags:
 | `--listen 0.0.0.0` | Let phones/tablets on your LAN open the UI too |
 | `--http-port 8721` | Change the port the web UI itself listens on |
 | `--n1mm` | Accept rotator commands from N1MM Logger+ (see below) |
+| `--hamlib` | Run a Hamlib `rotctld`-compatible server on TCP 4533 (see below) |
+| `--pst` | Accept PstRotator UDP commands on port 12000 (see below) |
 | `--no-browser` | Don't auto-open a browser tab |
 | `--reset-config` | Ignore and rewrite the saved settings |
 | `-v` | Debug-level logging |
@@ -91,18 +93,67 @@ broadcasts a small XML packet over UDP port 12040 and expects a separate
   Data**, tick **Rotator** and set the address to `<this machine's
   IP>:12040` (the default `127.0.0.1` only works if N1MM runs on the same
   machine).
-- Alt+J / callsign-bearing turns go into the same command queue the web UI
-  uses, so the compass animates every slew N1MM commands. N1MM's `<offset>`
-  is honored and `<stop>` maps to the RT-21 stop sequence.
+- Alt+J / callsign-bearing turns go through the same motion director as the
+  web UI, so the compass animates every slew N1MM commands. N1MM's `<offset>`
+  is honored, `<bidirectional>1` turns to whichever end of the beam is
+  nearer, and `<stop>` maps to the RT-21 stop sequence.
 - The live heading is reported back to the logger on UDP port 13010 in the
-  standard `rotorname @ tenths-of-degrees` form, so N1MM's bearing display
-  tracks the rotator.
+  standard `rotorname @ tenths-of-degrees` form, using the rotor name N1MM
+  sent, so N1MM's bearing display tracks the rotator.
 
 Because the RT-21 link has exactly one owner (this app), N1MM control works
 over the GHE bridge too — no fighting over the GHE box's one-reply buffer,
 which is what breaks running two rotator programs side by side. Note the
 UDP port accepts commands from any machine on the network while enabled,
 which is the point — but only enable it on a network you trust.
+
+## Hamlib and PstRotator
+
+Any program that can drive a rotator through Hamlib's network backend
+(GPredict, WSJT-X helpers, loggers, `rotctl` itself) can steer the RT-21
+through this app. Enable it with `--hamlib` or the settings dialog and point
+the client at `<this machine>:4533`, model 2 (`NET rotctl`):
+
+```sh
+rotctl -m 2 -r 127.0.0.1:4533 P 245 0     # turn to 245°
+rotctl -m 2 -r 127.0.0.1:4533 p           # read the heading
+rotctl -m 2 -r 127.0.0.1:4533 S           # stop
+```
+
+Supported: `P`/`\set_pos`, `p`/`\get_pos`, `S`/`\stop`, `K`/`\park`,
+`M`/`\move` (CW/CCW, mapped to the RT-21's 1.5 s jog), `_`/`\get_info`,
+`\dump_state`, and the `+` extended response mode. Elevation is accepted and
+ignored. Up to four clients at once (`hamlib_max_clients`).
+
+PstRotator-style UDP control is enabled with `--pst`:
+
+```sh
+echo '<PST><AZIMUTH>85</AZIMUTH></PST>' | nc -u -w1 127.0.0.1 12000
+echo '<PST><STOP>1</STOP></PST>'        | nc -u -w1 127.0.0.1 12000
+echo '<PST>AZ?</PST>'                   | nc -u -w1 127.0.0.1 12000  # "AZ:85\r" to port 12001
+```
+
+### Who wins when several programs steer
+
+Every source (web UI, N1MM, Hamlib, PstRotator) goes through one motion
+director that holds a single pending command, not a queue. The latest
+target replaces any older one, even mid-move; a stop replaces anything and
+goes out first; a burst of retargets reaches the controller as one command.
+The readout shows who set the current target (`→ 245° · N1MM`) and the log
+records every change (`Target 245° from N1MM (was 090° from Hamlib)`).
+
+`retarget_mode` controls a retarget during a move: `direct` (default) sends
+the new target straight away; `stop_first` stops, waits
+`retarget_settle_ms`, then turns.
+
+`park_heading` is unset by default, so park requests are refused
+(Hamlib `K` returns `RPRT -11`). Set it in the settings dialog to enable
+park.
+
+All three listeners bind to every interface by default (`n1mm_bind`,
+`hamlib_bind`, `pst_bind`), and none needs a password — enable only
+the ones you use, on a network you trust. Settings changes start or stop
+listeners immediately; no restart needed.
 
 ## Protocol corrections (inherited from 2.0)
 
@@ -163,9 +214,12 @@ stale-link watchdog, drop-and-reconnect, and clean thread shutdown:
 python3 test_web.py
 ```
 
-The suite also emulates N1MM Logger+ over UDP to exercise the `--n1mm`
-bridge: turn and stop packets, offset handling, and the heading report.
+The suite also emulates N1MM Logger+, Hamlib clients and PstRotator over
+real sockets: latest-command-wins overrides between sources, burst
+coalescing, stop priority, the Hamlib client cap and malformed input, the
+PstRotator reply port, listener restarts, and clean shutdown.
 
-33 tests, ~33 s, no dependencies. Also verified live against the real RT-21
+74 tests, ~45 s, no dependencies; passes on Python 3.9 through 3.14. The
+Hamlib server was also checked with Hamlib 4.5.5's own `rotctl -m 2`. Also verified live against the real RT-21
 (firmware 4.13.2) through its GH Everywhere interface: connect, poll, slew,
 motion status and return-to-heading all confirmed end to end.
