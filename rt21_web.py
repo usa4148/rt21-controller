@@ -94,6 +94,8 @@ CONFIG_DIR = _base_dir("config")
 DATA_DIR = _base_dir("data")
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = DATA_DIR / "logs" / "rt21.log"
+SKINS_DIR = Path(__file__).resolve().parent / "skins"   # shipped dial skins (see docs/skins.md)
+SKIN_ID = re.compile(r"[a-z0-9-]{1,40}")
 
 DEFAULT_PRESETS: list[dict[str, Any]] = [
     {"name": "EU", "heading": 30},
@@ -150,6 +152,8 @@ class Config:
     auto_connect_on_start: bool = True
     dark_mode: bool = True
     show_raw_traffic: bool = False
+    skin: str = ""                      # id of a dial skin from skins/skins.json; "" = classic rose
+    skin_overlay: bool = True           # keep drawing ticks and degree labels over a skin
     presets: list[dict[str, Any]] = field(default_factory=lambda: list(DEFAULT_PRESETS))
     http_port: int = 8721               # where this script's own web UI listens
     n1mm_enabled: bool = False          # accept rotator commands from N1MM Logger+
@@ -220,6 +224,10 @@ class Config:
             self.retarget_mode = "stop_first"
         self.retarget_settle_ms = _clamp(int(self.retarget_settle_ms), 0, 10000)
         self.retarget_min_interval = _clampf(float(self.retarget_min_interval), 0.0, 5.0)
+        self.skin = str(self.skin or "")
+        if not SKIN_ID.fullmatch(self.skin):
+            self.skin = ""
+        self.skin_overlay = bool(self.skin_overlay)
         if self.transport not in ("auto", "tcp", "ghe"):
             self.transport = "auto"
         if not isinstance(self.presets, list):
@@ -1840,6 +1848,29 @@ class Rt21Simulator(threading.Thread):
 # --------------------------------------------------------------------------- #
 # HTTP server + API
 # --------------------------------------------------------------------------- #
+def load_skins(directory: Path = SKINS_DIR) -> list[dict[str, str]]:
+    """The skins that are both listed in skins.json and present on disk.
+
+    Only ids from this list are ever served, so a request can never name an
+    arbitrary file. A missing or broken index just means no skins.
+    """
+    try:
+        entries = json.loads((directory / "skins.json").read_text(encoding="utf-8"))["skins"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    skins = []
+    for e in entries:
+        try:
+            sid, image = str(e["id"]), str(e["image"])
+        except (KeyError, TypeError):
+            continue
+        if SKIN_ID.fullmatch(sid) and image == f"{sid}.webp" and (directory / image).is_file():
+            skins.append({"id": sid, "name": str(e.get("name", sid)),
+                          "credit": str(e.get("credit", "")), "license": str(e.get("license", "")),
+                          "source": str(e.get("source", ""))})
+    return skins
+
+
 class AppContext:
     """What the HTTP handlers need: config, hub, link manager."""
 
@@ -1903,12 +1934,28 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             elif path == "/api/state":
                 self._json(200, self._state_payload())
+            elif path == "/api/skins":
+                self._json(200, {"skins": load_skins()})
+            elif path.startswith("/skins/") and path.endswith(".webp"):
+                self._serve_skin(path[len("/skins/"):-len(".webp")])
             elif path == "/events":
                 self._serve_events()
             else:
                 self._json(404, {"error": "not found"})
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def _serve_skin(self, skin_id: str) -> None:
+        if not any(s["id"] == skin_id for s in load_skins()):
+            self._json(404, {"error": "no such skin"})
+            return
+        body = (SKINS_DIR / f"{skin_id}.webp").read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/webp")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _state_payload(self) -> dict[str, Any]:
         cfg = self.ctx.cfg
@@ -1922,6 +1969,8 @@ class Handler(BaseHTTPRequestHandler):
                 "presets": cfg.presets,
                 "dark_mode": cfg.dark_mode,
                 "show_raw_traffic": cfg.show_raw_traffic,
+                "skin": cfg.skin,
+                "skin_overlay": cfg.skin_overlay,
                 "poll_interval": cfg.poll_interval,
                 "transport": cfg.transport,
                 "n1mm_enabled": cfg.n1mm_enabled,
@@ -2019,9 +2068,12 @@ class Handler(BaseHTTPRequestHandler):
             "poll_interval": float, "auto_reconnect": bool, "transport": str,
             "n1mm_enabled": bool, "hamlib_enabled": bool, "hamlib_port": int,
             "pst_enabled": bool, "pst_port": int, "retarget_mode": str,
-            "retarget_settle_ms": int,
+            "retarget_settle_ms": int, "skin": str, "skin_overlay": bool,
             "park_heading": lambda v: None if v in (None, "") else int(v),
         }
+        if body.get("skin") and not any(s["id"] == body["skin"] for s in load_skins()):
+            self._json(400, {"error": "unknown skin"})
+            return
         changed = []
         for key, cast in allowed.items():
             if key in body:
@@ -2181,7 +2233,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
     border: 1px solid var(--line); border-radius: 8px; padding: 8px;
   }
   dialog .hint { grid-column: 1 / -1; color: var(--dim); font-size: 12.5px; }
-  dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  #skinDlg { width: min(640px, 94vw); }
+  .skins { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 10px; }
+  .skin { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px;
+          font-size: 12.5px; text-align: center; line-height: 1.2; }
+  .skin img, .skin .none { width: 84px; height: 84px; border-radius: 50%; object-fit: cover;
+          border: 2px solid var(--line); background: var(--panel2); }
+  .skin .none { display: grid; place-items: center; color: var(--dim); font-size: 28px; }
+  .skin[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .skin[aria-pressed="true"] img, .skin[aria-pressed="true"] .none { border-color: var(--accent); }
+  #skinCredit { grid-column: auto; color: var(--dim); font-size: 12.5px; margin-top: 10px; min-height: 2.6em; }
+  #skinCredit a { color: var(--dim); }
+  dialog .actions { flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
   .footrow { display: flex; gap: 14px; align-items: center; color: var(--dim); font-size: 12.5px;
              flex-wrap: wrap; padding: 0 4px; }
   .footrow a { color: var(--dim); cursor: pointer; text-decoration: underline; }
@@ -2195,6 +2258,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <span id="statusDetail">Connecting to controller…</span>
     <span class="spacer"></span>
     <button id="connBtn">Connect</button>
+    <button id="skinBtn" title="Choose a dial skin">Skins</button>
     <button id="settingsBtn" title="Settings">⚙︎</button>
     <button id="themeBtn" title="Toggle theme">◐</button>
   </header>
@@ -2244,6 +2308,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<dialog id="skinDlg">
+  <h2>Dial skin</h2>
+  <div class="skins" id="skinGrid"></div>
+  <div id="skinCredit"></div>
+  <label style="display:block;margin-top:8px"><input type="checkbox" id="skinOverlay">
+    Overlay degree scale and labels</label>
+  <div class="actions"><button id="skinDone" class="primary">Done</button></div>
+</dialog>
+
 <dialog id="settingsDlg">
   <h2>Settings</h2>
   <div class="grid">
@@ -2286,7 +2359,7 @@ const $ = id => document.getElementById(id);
 const S = {
   link: "disconnected", detail: "", heading: null, moving: false,
   target: null, targetSource: null, dragTarget: null, cfg: null, raw: false,
-  listeners: {},
+  listeners: {}, skinId: "", skinImg: null,
 };
 const SOURCES = {web: "web", n1mm: "N1MM", hamlib: "Hamlib", pst: "PstRotator"};
 
@@ -2342,7 +2415,7 @@ function connectEvents() {
   es.addEventListener("listeners", e => {
     Object.assign(S.listeners, JSON.parse(e.data)); renderListeners();
   });
-  es.addEventListener("config", e => { S.cfg = JSON.parse(e.data); renderPresets(); draw(); });
+  es.addEventListener("config", e => { S.cfg = JSON.parse(e.data); renderPresets(); applySkin(); draw(); });
   es.onerror = () => {
     S.link = "ui-lost"; S.detail = "Lost contact with the controller app";
     renderStatus();     /* EventSource reconnects on its own */
@@ -2356,6 +2429,7 @@ function applySnapshot(snap) {
   S.raw = !!snap.config.show_raw_traffic;
   $("rawChk").checked = S.raw;
   document.documentElement.dataset.theme = snap.config.dark_mode ? "dark" : "light";
+  applySkin();
   $("target").max = snap.config.max_heading;
   $("connInfo").textContent = snap.config.host + ":" + snap.config.port +
                               " · unit " + snap.config.unit;
@@ -2453,28 +2527,45 @@ function draw() {
   const cx = w / 2, cy = w / 2, R = w / 2 - 14;
   const line = cssVar("--line"), dim = cssVar("--dim"), text = cssVar("--text");
 
-  g.lineWidth = 2; g.strokeStyle = line;
-  g.beginPath(); g.arc(cx, cy, R, 0, Math.PI * 2); g.stroke();
-  g.beginPath(); g.arc(cx, cy, R * 0.62, 0, Math.PI * 2);
-  g.strokeStyle = line; g.globalAlpha = 0.5; g.stroke(); g.globalAlpha = 1;
+  const skin = S.skinImg && S.skinImg.complete && S.skinImg.naturalWidth ? S.skinImg : null;
+  const scale = !skin || (S.cfg && S.cfg.skin_overlay !== false);
+  if (skin) {
+    g.save();
+    g.beginPath(); g.arc(cx, cy, R + 8, 0, Math.PI * 2); g.clip();
+    g.drawImage(skin, cx - R - 8, cy - R - 8, (R + 8) * 2, (R + 8) * 2);
+    g.restore();
+  }
+  g.lineWidth = 2; g.strokeStyle = skin ? "rgba(0,0,0,.55)" : line;
+  g.beginPath(); g.arc(cx, cy, R + (skin ? 8 : 0), 0, Math.PI * 2); g.stroke();
+  if (!skin) {
+    g.beginPath(); g.arc(cx, cy, R * 0.62, 0, Math.PI * 2);
+    g.strokeStyle = line; g.globalAlpha = 0.5; g.stroke(); g.globalAlpha = 1;
+  }
 
   /* ticks + labels */
-  for (let d = 0; d < 360; d += 5) {
+  for (let d = 0; d < 360 && scale; d += 5) {
     const major = d % 30 === 0, mid = d % 10 === 0;
     const a = (d - 90) * Math.PI / 180;
     const r1 = R, r2 = R - (major ? 14 : mid ? 9 : 5);
-    g.strokeStyle = major ? dim : line; g.lineWidth = major ? 2 : 1;
     g.beginPath();
     g.moveTo(cx + r1 * Math.cos(a), cy + r1 * Math.sin(a));
     g.lineTo(cx + r2 * Math.cos(a), cy + r2 * Math.sin(a));
+    if (skin) {   /* dark halo so ticks stay readable on any artwork */
+      g.strokeStyle = "rgba(0,0,0,.6)"; g.lineWidth = (major ? 2 : 1) + 2.5; g.stroke();
+    }
+    g.strokeStyle = skin ? "#fff" : (major ? dim : line); g.lineWidth = major ? 2 : 1;
     g.stroke();
     if (major) {
       const cardinal = {0: "N", 90: "E", 180: "S", 270: "W"}[d];
       const rl = R - 28;
-      g.fillStyle = cardinal ? text : dim;
+      g.fillStyle = skin ? "#fff" : (cardinal ? text : dim);
       g.font = (cardinal ? "700 " + Math.max(15, w * 0.038) : "500 " + Math.max(11, w * 0.024)) +
                "px -apple-system, sans-serif";
       g.textAlign = "center"; g.textBaseline = "middle";
+      if (skin) {
+        g.lineJoin = "round"; g.lineWidth = 4; g.strokeStyle = "rgba(0,0,0,.7)";
+        g.strokeText(cardinal || String(d), cx + rl * Math.cos(a), cy + rl * Math.sin(a));
+      }
       g.fillText(cardinal || String(d), cx + rl * Math.cos(a), cy + rl * Math.sin(a));
     }
   }
@@ -2508,7 +2599,9 @@ function draw() {
     g.lineTo(cx + side * Math.cos(pa), cy + side * Math.sin(pa));
     g.lineTo(backX, backY);
     g.lineTo(cx - side * Math.cos(pa), cy - side * Math.sin(pa));
-    g.closePath(); g.fill();
+    g.closePath();
+    if (skin) { g.lineJoin = "round"; g.lineWidth = 3; g.strokeStyle = "rgba(255,255,255,.85)"; g.stroke(); }
+    g.fill();
   }
 
   /* hub */
@@ -2632,6 +2725,69 @@ $("setSave").onclick = async () => {
   });
   if (ok) $("settingsDlg").close();
 };
+
+/* ------------------------------------------------------------------ skins */
+function applySkin() {
+  const id = (S.cfg && S.cfg.skin) || "";
+  if (id === S.skinId) return;
+  S.skinId = id;
+  if (!id) { S.skinImg = null; draw(); return; }
+  const img = new Image();
+  img.onload = () => { if (S.skinId === id) { S.skinImg = img; draw(); } };
+  img.onerror = () => { if (S.skinId === id) { S.skinImg = null; draw(); } };
+  img.src = "/skins/" + encodeURIComponent(id) + ".webp";
+}
+
+let skinList = [];
+function skinCredit(id) {
+  const box = $("skinCredit"); box.textContent = "";
+  const s = skinList.find(x => x.id === id);
+  if (!s) { box.textContent = "Classic drawn rose."; return; }
+  box.append(s.name + " — " + (s.credit || "unknown") + " · " + (s.license || "license unknown") + " · ");
+  if (/^https:\/\//.test(s.source)) {
+    const a = document.createElement("a");
+    a.href = s.source; a.target = "_blank"; a.rel = "noopener"; a.textContent = "source";
+    box.append(a);
+  } else box.append(s.source || "");
+}
+function renderSkins() {
+  const grid = $("skinGrid"); grid.textContent = "";
+  const add = (id, label, thumb) => {
+    const b = document.createElement("button");
+    b.className = "skin"; b.type = "button";
+    b.setAttribute("aria-pressed", String((S.cfg.skin || "") === id));
+    b.append(thumb, label);
+    b.onclick = async () => {
+      if (await api("/api/config", {skin: id})) { S.cfg.skin = id; applySkin(); renderSkins(); }
+    };
+    b.onmouseenter = b.onfocus = () => skinCredit(id);
+    b.onmouseleave = b.onblur = () => skinCredit(S.cfg.skin || "");
+    grid.append(b);
+  };
+  const none = document.createElement("div"); none.className = "none"; none.textContent = "∅";
+  add("", "Classic", none);
+  for (const s of skinList) {
+    const img = document.createElement("img");
+    img.src = "/skins/" + encodeURIComponent(s.id) + ".webp"; img.alt = ""; img.loading = "lazy";
+    img.width = img.height = 84;
+    add(s.id, s.name, img);
+  }
+  skinCredit(S.cfg.skin || "");
+}
+$("skinBtn").onclick = async () => {
+  if (!S.cfg) return;
+  try { skinList = (await (await fetch("/api/skins")).json()).skins || []; }
+  catch (e) { skinList = []; }
+  $("skinOverlay").checked = S.cfg.skin_overlay !== false;
+  renderSkins();
+  $("skinDlg").showModal();
+};
+$("skinOverlay").onchange = async () => {
+  if (await api("/api/config", {skin_overlay: $("skinOverlay").checked})) {
+    S.cfg.skin_overlay = $("skinOverlay").checked; draw();
+  }
+};
+$("skinDone").onclick = () => $("skinDlg").close();
 
 window.addEventListener("resize", draw);
 connectEvents();
