@@ -11,9 +11,15 @@ __pycache__/
 *.pdf
 *.png
 !docs/screenshot.png
+!docs/screenshot-skin.png
+!docs/skins-gallery.png
 *.jpeg
 *.jpg
 *.msi
 GH-Tracker/
 RT-21-Setup-Utility-4.11/
 old/
+
+# dial skins: raw originals stay local; processed skins/*.webp are committed
+skins/raw/
+.venv-tools/

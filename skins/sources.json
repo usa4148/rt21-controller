@@ -1,0 +1,103 @@
+{
+  "size": 800,
+  "quality": 82,
+  "skins": [
+    {
+      "id": "noaa-black",
+      "name": "NOAA Black",
+      "file": "Compass_Rose-Black.svg",
+      "credit": "NOAA, DoC, DoD, NGA",
+      "license": "Public domain",
+      "source": "https://commons.wikimedia.org/wiki/File:Compass_Rose-Black.svg"
+    },
+    {
+      "id": "noaa-purple",
+      "name": "NOAA Purple",
+      "file": "Compass_Rose-Purple.svg",
+      "credit": "NOAA, DoC, DoD, NGA",
+      "license": "Public domain",
+      "source": "https://commons.wikimedia.org/wiki/File:Compass_Rose-Purple.svg"
+    },
+    {
+      "id": "modern-nautical",
+      "name": "Modern Nautical",
+      "file": "Modern_nautical_compass_rose.svg",
+      "credit": "Mysid",
+      "license": "Public domain",
+      "source": "https://commons.wikimedia.org/wiki/File:Modern_nautical_compass_rose.svg"
+    },
+    {
+      "id": "fleur-1607",
+      "name": "Fleur 1607",
+      "file": "Compass_rose_1607.svg",
+      "credit": "Lordoftheloch",
+      "license": "CC0",
+      "source": "https://commons.wikimedia.org/wiki/File:Compass_rose_1607.svg",
+      "trim": true,
+      "margin": 0.04
+    },
+    {
+      "id": "kunstmann",
+      "name": "Kunstmann IV",
+      "file": "Kunstmann_IV_Compass_rose.jpg",
+      "credit": "Pedro Reinel",
+      "license": "Public domain",
+      "source": "https://commons.wikimedia.org/wiki/File:Kunstmann_IV_Compass_rose.jpg",
+      "center": [
+        0.695,
+        0.153
+      ],
+      "span": 0.17
+    },
+    {
+      "id": "turin-1523",
+      "name": "Turin 1523",
+      "file": "Map_of_Turin_1523_Compass_rose.jpg",
+      "credit": "Juan Vespucci; Nuño García",
+      "license": "Public domain",
+      "source": "https://commons.wikimedia.org/wiki/File:Map_of_Turin_1523_Compass_rose.jpg",
+      "center": [
+        0.5,
+        0.52
+      ],
+      "span": 0.8
+    },
+    {
+      "id": "propaganda-map",
+      "name": "Propaganda Map",
+      "file": "Propaganda_Map_Compass_rose.jpg",
+      "credit": "Diogo Ribeiro; William Griggs",
+      "license": "Public domain",
+      "source": "https://commons.wikimedia.org/wiki/File:Propaganda_Map_Compass_rose.jpg",
+      "center": [
+        0.505,
+        0.495
+      ],
+      "span": 0.8
+    },
+    {
+      "id": "martines-1591",
+      "name": "Martines 1591",
+      "file": "Martines_Atlas_1591_Compass_rose.jpg",
+      "credit": "Joan Martines",
+      "license": "Public domain",
+      "source": "https://commons.wikimedia.org/wiki/File:Compass_Rose_Cropped_from_Martines_Atlas_1591_(03_of_14).jpg"
+    },
+    {
+      "id": "bowen-1748",
+      "name": "Bowen 1748",
+      "file": "Bowen_1748_Compass_rose.jpg",
+      "credit": "Bowen",
+      "license": "Public domain",
+      "source": "https://commons.wikimedia.org/wiki/File:Compass_rose_detail_from_1748_Bowen_Mariner%E2%80%99s_Compass_and_Armillary_Sphere_-_Geographicus_-_CircleofWinds-bowen-1747_(cropped).jpg"
+    },
+    {
+      "id": "boazio-1585",
+      "name": "Boazio 1585",
+      "file": "Boazio_1585_Compass_rose.jpg",
+      "credit": "Baptista Boazio",
+      "license": "Public domain",
+      "source": "https://commons.wikimedia.org/wiki/File:Compass_rose_art_in_1585_-_from,_Boazio-Sir_Francis_Drake_in_Cartagena_(cropped).jpg"
+    }
+  ]
+}
