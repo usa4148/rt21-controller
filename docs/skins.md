@@ -12,11 +12,11 @@ degree scale) and is shared by every browser tab.
 
 ## What ships
 
-Ten skins in `skins/`, each one a single `<id>.webp`:
+Eleven skins in `skins/`, each one a single `<id>.webp`:
 
 | Kind | Skins |
 | --- | --- |
-| Vector charts (rendered from SVG) | `noaa-black`, `noaa-purple`, `modern-nautical`, `fleur-1607` |
+| Vector (rendered from SVG) | `octagram-rose` (original 8-point rose, CC0), `noaa-black`, `noaa-purple`, `modern-nautical`, `fleur-1607` |
 | Historic charts and engravings | `kunstmann`, `turin-1523`, `propaganda-map`, `martines-1591`, `bowen-1748`, `boazio-1585` |
 
 `skins/skins.json` is the generated index the app reads (id, display name,
@@ -33,8 +33,9 @@ that produces it.
 | Metadata | None. EXIF, ICC and XMP chunks are not written (no camera, GPS or editor data in the repo). |
 | Colour | Flattened to opaque RGB. Vector art is composited on white. |
 
-The 10 skins total about 0.9 MB. Originals (up to ~2 MB each) are kept out of
-git in `skins/raw/`.
+The 11 skins total about 0.95 MB. Third-party originals (up to ~2 MB each) are kept
+out of git in `skins/raw/`; our own source art (`octagram-rose.svg`) is committed
+in `skins/art/`.
 
 ## Rebuilding or adding a skin
 
@@ -43,7 +44,9 @@ python3 -m venv .venv-tools && . .venv-tools/bin/activate
 pip install -r tools/requirements.txt      # Pillow + resvg-py, build-time only
 ```
 
-1. Put the original in `skins/raw/`. SVG, JPEG, PNG and WebP all work.
+1. Put the original in `skins/raw/` (or, for art you made yourself, `skins/art/`,
+   which is committed). SVG, JPEG, PNG and WebP all work. The build looks in
+   `art/` first, then `raw/`.
    Check it is really an image: a "Save as" from a Wikimedia *File:* page saves
    the HTML page, not the picture. Use the "Original file" link.
 2. Add an entry to `skins/sources.json`:
@@ -74,8 +77,8 @@ pip install -r tools/requirements.txt      # Pillow + resvg-py, build-time only
 4. `python3 test_skins.py` checks that the index and files agree, every skin is
    800 × 800, under budget and metadata-free, and that every skin is credited.
 
-Commit `skins/*.webp`, `skins/skins.json` and `skins/sources.json`. `skins/raw/`
-is git-ignored.
+Commit `skins/*.webp`, `skins/skins.json`, `skins/sources.json` and any `skins/art/`
+file. `skins/raw/` is git-ignored.
 
 The screenshots in `docs/` (`screenshot.png`, `screenshot-skin.png`) are taken
 by hand against the demo simulator (`python3 rt21_web.py --demo`) at 1280 × 775;
@@ -93,7 +96,7 @@ retake them when the UI changes.
 
 ## Licensing and provenance
 
-All ten shipped skins are public domain or CC0; the credit and source for each
+All eleven shipped skins are public domain or CC0; the credit and source for each
 is in `skins.json` and appears in the picker. Four photographs (three from
 Flickr, one from Pixabay) were removed because their licenses could not be
 confirmed. Only add a skin whose license you can state.
