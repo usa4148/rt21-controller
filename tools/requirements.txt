@@ -1,0 +1,3 @@
+# Build-time only: tools/make_skins.py. The app itself stays stdlib-only.
+Pillow>=10.0
+resvg-py>=0.2   # bundles its own SVG renderer: no system librsvg/cairo needed

@@ -14,6 +14,7 @@ import socket
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -22,10 +23,14 @@ from rt21_web import (
     AppContext,
     Config,
     Handler,
+    HamlibListener,
     Hub,
     LinkManager,
     LinkState,
+    ListenerSet,
+    MotionDirector,
     N1mmBridge,
+    PstRotatorListener,
     Protocol,
     RotatorLink,
     Rt21Simulator,
@@ -272,6 +277,15 @@ class ConfigTests(unittest.TestCase):
         cfg.sanitize()
         self.assertEqual(cfg.presets, [{"name": "OK", "heading": 359}])
 
+    def test_sanitize_skin(self) -> None:
+        for bad in ("../etc/passwd", "UPPER", "a b", "x" * 41, None):
+            cfg = Config(skin=bad)  # type: ignore[arg-type]
+            cfg.sanitize()
+            self.assertEqual(cfg.skin, "", bad)
+        cfg = Config(skin="noaa-black", skin_overlay=0)  # type: ignore[arg-type]
+        cfg.sanitize()
+        self.assertEqual((cfg.skin, cfg.skin_overlay), ("noaa-black", False))
+
     def test_sanitize_bad_host(self) -> None:
         cfg = Config(host="  ")
         cfg.sanitize()
@@ -441,6 +455,45 @@ class HttpApiTests(unittest.TestCase):
             self.assertIn("config", snap)
             self.assertIn("link", snap)
 
+    def _get_raw(self, path: str):
+        try:
+            return urllib.request.urlopen(self.base + path, timeout=5)
+        except urllib.error.HTTPError as e:
+            return e
+
+    def test_08b_skin_catalog_and_images(self) -> None:
+        skins = self._get("/api/skins")["skins"]
+        self.assertGreaterEqual(len(skins), 1)
+        for skin in skins:
+            for key in ("id", "name", "credit", "license", "source"):
+                self.assertIn(key, skin)
+        with self._get_raw(f"/skins/{skins[0]['id']}.webp") as r:
+            body = r.read()
+            self.assertEqual(r.status, 200)
+            self.assertEqual(r.headers["Content-Type"], "image/webp")
+        self.assertEqual(body[:4], b"RIFF")
+        self.assertEqual(body[8:12], b"WEBP")
+
+    def test_08c_skin_paths_are_whitelisted(self) -> None:
+        for path in ("/skins/nope.webp", "/skins/sources.json", "/skins/skins.webp",
+                     "/skins/..%2Frt21_web.webp", "/skins/%2e%2e/rt21_web.webp",
+                     "/skins/raw/Compass_Rose-Black.webp"):
+            r = self._get_raw(path)
+            self.assertEqual(r.code, 404, path)
+
+    def test_08d_config_skin_roundtrip(self) -> None:
+        skin = self._get("/api/skins")["skins"][0]["id"]
+        code, _ = self._post("/api/config", {"skin": skin, "skin_overlay": False})
+        self.assertEqual(code, 200)
+        cfg = self._get("/api/state")["config"]
+        self.assertEqual((cfg["skin"], cfg["skin_overlay"]), (skin, False))
+        code, _ = self._post("/api/config", {"skin": "no-such-skin"})
+        self.assertEqual(code, 400)
+        self.assertEqual(self._get("/api/state")["config"]["skin"], skin)  # unchanged
+        code, _ = self._post("/api/config", {"skin": "", "skin_overlay": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(self._get("/api/state")["config"]["skin"], "")
+
     def test_09_disconnect(self) -> None:
         code, _ = self._post("/api/disconnect")
         self.assertEqual(code, 200)
@@ -509,20 +562,21 @@ class WatchdogTests(unittest.TestCase):
 class N1mmBridgeTests(unittest.TestCase):
     """The N1MM UDP bridge against the simulator: turn, stop, heading report."""
 
-    # What N1MM Logger+ actually broadcasts on port 12040 (Alt+J).
-    TURN = ("<N1MMRotor><rotor><rotorname>teststack</rotorname>"
+    # What N1MM Logger+ actually broadcasts on port 12040 (Alt+J / stop).
+    TURN = ("<N1MMRotor><rotor>teststack</rotor>"
             "<goazi>45.0</goazi><offset>0.0</offset>"
             "<bidirectional>0</bidirectional><freqband>14.0</freqband>"
-            "</rotor></N1MMRotor>")
-    STOP = ("<N1MMRotor><rotor><rotorname>teststack</rotorname>"
-            "<stop></stop><freqband>14.0</freqband></rotor></N1MMRotor>")
+            "</N1MMRotor>")
+    STOP = ("<N1MMRotor><stop><rotor>teststack</rotor>"
+            "<freqband>14.0</freqband></stop></N1MMRotor>")
 
     def setUp(self) -> None:
         self.sim = Rt21Simulator(speed=400.0)
         self.sim.start()
         self.cfg = Config(host="127.0.0.1", port=self.sim.port,
                           poll_interval=0.2, stale_timeout=3.0,
-                          n1mm_enabled=True, n1mm_port=0)  # 0 = ephemeral port
+                          n1mm_enabled=True, n1mm_port=0,  # 0 = ephemeral port
+                          n1mm_bind="127.0.0.1")
         self.cfg.transport = "tcp"
         self.hub = Hub()
         self.manager = LinkManager(self.cfg, self.hub)
@@ -579,6 +633,532 @@ class N1mmBridgeTests(unittest.TestCase):
         time.sleep(0.3)
         self.assertIsNone(self.hub.state["target"])
         self.assertTrue(self.bridge.is_alive())
+
+
+# --------------------------------------------------------------------------- #
+class N1mmParseTests(unittest.TestCase):
+    """The pure N1MM packet parser, against real packet shapes."""
+
+    def test_real_turn_packet(self) -> None:
+        p = N1mmBridge.parse(N1mmBridgeTests.TURN)
+        self.assertEqual(p["name"], "teststack")
+        self.assertEqual(p["azimuth"], 45.0)
+        self.assertFalse(p["stop"])
+        self.assertFalse(p["bidirectional"])
+
+    def test_real_stop_packet_carries_name(self) -> None:
+        p = N1mmBridge.parse(N1mmBridgeTests.STOP)
+        self.assertTrue(p["stop"])
+        self.assertEqual(p["name"], "teststack")
+
+    def test_legacy_rotorname_tag_still_works(self) -> None:
+        p = N1mmBridge.parse("<N1MMRotor><rotor><rotorname>old</rotorname>"
+                             "<goazi>10</goazi></rotor></N1MMRotor>")
+        self.assertEqual(p["name"], "old")
+        self.assertEqual(p["azimuth"], 10.0)
+
+    def test_bidirectional_flag(self) -> None:
+        p = N1mmBridge.parse(N1mmBridgeTests.TURN.replace(
+            "<bidirectional>0", "<bidirectional>1"))
+        self.assertTrue(p["bidirectional"])
+
+
+# --------------------------------------------------------------------------- #
+class FakeManager:
+    """Stands in for LinkManager: always connected, no link thread."""
+
+    def __init__(self, cfg: Config, hub: Hub) -> None:
+        self.connected = True
+        self.director = MotionDirector(cfg, hub, self)
+
+
+class MotionDirectorTests(unittest.TestCase):
+    """Latest-wins arbitration, without a link thread or a socket."""
+
+    def setUp(self) -> None:
+        self.cfg = Config(retarget_min_interval=0.0)
+        self.hub = Hub()
+        self.mgr = FakeManager(self.cfg, self.hub)
+        self.d = self.mgr.director
+        self.p = Protocol(1)
+
+    def test_latest_goto_wins(self) -> None:
+        self.d.goto(90, "hamlib")
+        self.d.goto(180, "web")
+        self.d.goto(270, "n1mm")
+        self.assertEqual(self.d.take(self.p, False), ["AP1270\r;", "AM1;"])
+        self.assertEqual(self.d.take(self.p, False), [])
+        self.assertEqual(self.hub.state["target"], 270)
+        self.assertEqual(self.hub.state["target_source"], "n1mm")
+
+    def test_stop_replaces_pending_goto(self) -> None:
+        self.d.goto(90, "hamlib")
+        self.d.stop("pst")
+        self.assertEqual(self.d.take(self.p, True), [";", "ST1;"])
+        self.assertEqual(self.d.take(self.p, True), [], "the goto must never be sent")
+        self.assertIsNone(self.hub.state["target"])
+
+    def test_goto_after_stop_replaces_stop(self) -> None:
+        self.d.stop("web")
+        self.d.goto(45, "web")
+        self.assertEqual(self.d.take(self.p, False), ["AP1045\r;", "AM1;"])
+
+    def test_duplicate_of_active_target_is_dropped(self) -> None:
+        self.d.goto(120, "hamlib")
+        self.d.take(self.p, False)
+        self.d.goto(120, "hamlib")                 # e.g. a tracker re-sending
+        self.assertEqual(self.d.take(self.p, True), [])
+
+    def test_min_interval_delays_but_keeps_latest(self) -> None:
+        self.cfg.retarget_mode = "direct"
+        self.cfg.retarget_min_interval = 0.3
+        self.d.goto(10, "web")
+        self.assertTrue(self.d.take(self.p, False))
+        self.d.goto(20, "web")
+        self.assertEqual(self.d.take(self.p, True), [], "too soon after the last goto")
+        time.sleep(0.35)
+        self.assertEqual(self.d.take(self.p, True), ["AP1020\r;", "AM1;"])
+
+    def test_stop_is_never_rate_limited(self) -> None:
+        self.cfg.retarget_min_interval = 5.0
+        self.d.goto(10, "web")
+        self.d.take(self.p, False)
+        self.d.stop("web")
+        self.assertEqual(self.d.take(self.p, True), [";", "ST1;"])
+
+    def test_stop_first_waits_for_stopped_then_settle(self) -> None:
+        self.cfg.retarget_mode = "stop_first"
+        self.cfg.retarget_settle_ms = 200
+        self.d.goto(90, "hamlib")
+        self.d.take(self.p, False)
+        self.d.goto(0, "hamlib")                   # reversal mid-move
+        self.assertEqual(self.d.take(self.p, True), [";", "ST1;"])
+        time.sleep(0.3)
+        self.assertEqual(self.d.take(self.p, True), [], "still turning: must wait")
+        self.assertEqual(self.d.take(self.p, False), [], "just stopped: DELAYS not over")
+        time.sleep(0.25)
+        self.assertEqual(self.d.take(self.p, False), ["AP1000\r;", "AM1;"])
+
+    def test_stop_first_counts_a_fresh_goto_as_moving(self) -> None:
+        # Over GHE the status poll lags; a goto sent a moment ago is in motion
+        self.cfg.retarget_mode = "stop_first"
+        self.d.goto(90, "hamlib")
+        self.d.take(self.p, False)
+        self.d.goto(0, "hamlib")
+        self.assertEqual(self.d.take(self.p, False), [";", "ST1;"])
+
+    def test_stop_first_timeout_sends_anyway(self) -> None:
+        self.cfg.retarget_mode = "stop_first"
+        self.d.STOP_TIMEOUT = 0.2
+        self.d.goto(90, "web")
+        self.d.take(self.p, False)
+        self.d.goto(0, "web")
+        self.d.take(self.p, True)
+        time.sleep(0.25)
+        self.assertEqual(self.d.take(self.p, True), ["AP1000\r;", "AM1;"])
+
+    def test_explicit_stop_then_goto_waits_for_delays(self) -> None:
+        self.cfg.retarget_settle_ms = 200
+        self.d.goto(90, "n1mm")
+        self.d.take(self.p, False)
+        self.d.stop("n1mm")
+        self.assertEqual(self.d.take(self.p, True), [";", "ST1;"])
+        self.d.goto(0, "n1mm")
+        self.assertEqual(self.d.take(self.p, False), [])
+        time.sleep(0.25)
+        self.assertEqual(self.d.take(self.p, False), ["AP1000\r;", "AM1;"])
+
+    def test_stop_while_idle_does_not_delay_next_goto(self) -> None:
+        self.d.stop("web")
+        self.d.take(self.p, False)
+        self.d.goto(45, "web")
+        self.assertEqual(self.d.take(self.p, False), ["AP1045\r;", "AM1;"])
+
+    def test_goto_that_never_moves_is_resent_once(self) -> None:
+        self.d.VERIFY_AFTER = 0.1
+        self.hub.publish("heading", {"deg": 10.0})
+        self.d.goto(200, "hamlib")
+        self.d.take(self.p, False)
+        time.sleep(0.15)
+        self.assertEqual(self.d.take(self.p, False), ["AP1200\r;", "AM1;"])
+        time.sleep(0.15)
+        self.assertEqual(self.d.take(self.p, False), [], "only one retry")
+
+    def test_goto_that_moved_is_not_resent(self) -> None:
+        self.d.VERIFY_AFTER = 0.1
+        self.hub.publish("heading", {"deg": 10.0})
+        self.d.goto(200, "hamlib")
+        self.d.take(self.p, False)
+        self.hub.publish("heading", {"deg": 20.0})
+        self.d.take(self.p, False)
+        time.sleep(0.15)
+        self.assertEqual(self.d.take(self.p, False), [])
+
+    def test_direct_mode_retargets_while_moving(self) -> None:
+        self.cfg.retarget_mode = "direct"
+        self.d.goto(10, "web")
+        self.d.take(self.p, False)
+        self.d.goto(200, "n1mm")
+        self.assertEqual(self.d.take(self.p, True), ["AP1200\r;", "AM1;"])
+
+    def test_overlap_heading_goes_out_raw(self) -> None:
+        self.d.goto(400, "web")
+        self.assertEqual(self.d.take(self.p, False)[0], "AP1400\r;")
+        self.assertEqual(self.hub.state["target"], 40)
+
+    def test_disconnected_refuses(self) -> None:
+        self.mgr.connected = False
+        self.assertFalse(self.d.goto(10, "web"))
+        self.assertFalse(self.d.stop("web"))
+        self.assertEqual(self.d.take(self.p, False), [])
+
+    def test_park(self) -> None:
+        self.assertIsNone(self.d.park("hamlib"), "park is off until configured")
+        self.cfg.park_heading = 180
+        self.assertTrue(self.d.park("hamlib"))
+        self.assertEqual(self.d.take(self.p, False)[0], "AP1180\r;")
+
+    def test_jog(self) -> None:
+        self.d.goto(10, "web")
+        self.d.jog("cw", "hamlib")
+        self.assertEqual(self.d.take(self.p, False), ["AB1;"])
+        self.assertFalse(self.d.jog("up", "hamlib"))
+
+    def test_discard_forgets_pending(self) -> None:
+        self.d.goto(10, "web")
+        self.d.discard()
+        self.assertEqual(self.d.take(self.p, False), [])
+
+
+# --------------------------------------------------------------------------- #
+class RecordingDirector:
+    """Records what a listener asked for."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+        self.ok = True
+        self.park_result: "bool | None" = None
+
+    def goto(self, heading, source):
+        self.calls.append(("goto", heading, source)); return self.ok
+
+    def stop(self, source):
+        self.calls.append(("stop", source)); return self.ok
+
+    def jog(self, direction, source):
+        self.calls.append(("jog", direction, source)); return self.ok
+
+    def park(self, source):
+        self.calls.append(("park", source)); return self.park_result
+
+
+class StubManager:
+    def __init__(self) -> None:
+        self.connected = True
+        self.director = RecordingDirector()
+
+
+class HamlibProtocolTests(unittest.TestCase):
+    """rotctld command lines -> director calls and wire replies."""
+
+    def setUp(self) -> None:
+        self.cfg = Config(hamlib_bind="127.0.0.1", hamlib_port=0)
+        self.hub = Hub()
+        self.mgr = StubManager()
+        self.h = HamlibListener(self.cfg, self.hub, self.mgr)
+        self.calls = self.mgr.director.calls
+
+    def tearDown(self) -> None:
+        self.h.shutdown()
+
+    def line(self, text: str) -> str:
+        return self.h.handle_line(text)[0]
+
+    def test_set_pos(self) -> None:
+        self.assertEqual(self.line("P 180.5 0"), "RPRT 0\n")
+        self.assertEqual(self.calls[-1], ("goto", 180, "hamlib"))
+        self.assertEqual(self.line("\\set_pos 90 45"), "RPRT 0\n")
+        self.assertEqual(self.calls[-1], ("goto", 90, "hamlib"))
+
+    def test_set_pos_negative_and_360(self) -> None:
+        self.line("P -90 0")
+        self.assertEqual(self.calls[-1], ("goto", 270, "hamlib"))
+        self.line("P 360 0")
+        self.assertEqual(self.calls[-1], ("goto", 0, "hamlib"))
+
+    def test_set_pos_bad_input(self) -> None:
+        for bad in ("P", "P abc 0", "P 500 0", "P nan 0", "P -200 0"):
+            self.assertEqual(self.line(bad), "RPRT -1\n", bad)
+        self.assertEqual(self.calls, [])
+
+    def test_set_pos_when_disconnected(self) -> None:
+        self.mgr.director.ok = False
+        self.assertEqual(self.line("P 10 0"), "RPRT -6\n")
+
+    def test_get_pos(self) -> None:
+        self.assertEqual(self.line("p"), "RPRT -6\n", "no heading yet")
+        self.hub.publish("heading", {"deg": 123.4})
+        self.assertEqual(self.line("p"), "123.40\n0.00\n")
+        self.assertEqual(self.line("\\get_pos"), "123.40\n0.00\n")
+
+    def test_extended_response(self) -> None:
+        self.hub.publish("heading", {"deg": 45.0})
+        self.assertEqual(self.line("+p"),
+                         "get_pos:\nAzimuth: 45.00\nElevation: 0.00\nRPRT 0\n")
+        self.assertEqual(self.line("+P 10 0"), "set_pos: 10 0\nRPRT 0\n")
+        self.assertEqual(self.line(";p"), "get_pos:;Azimuth: 45.00;Elevation: 0.00;RPRT 0\n")
+
+    def test_stop_park_move(self) -> None:
+        self.assertEqual(self.line("S"), "RPRT 0\n")
+        self.assertEqual(self.calls[-1], ("stop", "hamlib"))
+        self.assertEqual(self.line("K"), "RPRT -11\n", "park not configured")
+        self.mgr.director.park_result = True
+        self.assertEqual(self.line("K"), "RPRT 0\n")
+        self.assertEqual(self.line("M 8 50"), "RPRT 0\n")
+        self.assertEqual(self.calls[-1], ("jog", "ccw", "hamlib"))
+        self.assertEqual(self.line("M CW 50"), "RPRT 0\n")
+        self.assertEqual(self.calls[-1], ("jog", "cw", "hamlib"))
+        self.assertEqual(self.line("M 2 50"), "RPRT -4\n", "elevation moves")
+
+    def test_dump_state_matches_netrotctl(self) -> None:
+        lines = self.line("\\dump_state").splitlines()
+        self.assertEqual(lines[0], "1")                 # protocol version
+        self.assertIn("min_az=0.000000", lines)
+        self.assertIn("max_az=360.000000", lines)
+        self.assertIn("rot_type=Az", lines)
+        self.assertEqual(lines[-1], "done")
+
+    def test_info_quit_unknown_blank(self) -> None:
+        self.assertIn(rt21_web_app_name(), self.line("_"))
+        self.assertEqual(self.h.handle_line("q"), ("", True))
+        self.assertEqual(self.line("Z"), "RPRT -4\n")
+        self.assertEqual(self.line("\\nonsense"), "RPRT -4\n")
+        self.assertEqual(self.line("   "), "")
+
+
+def rt21_web_app_name() -> str:
+    return app.APP_NAME
+
+
+class PstParseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cfg = Config(pst_bind="127.0.0.1", pst_port=0)
+        self.hub = Hub()
+        self.mgr = StubManager()
+        self.pst = PstRotatorListener(self.cfg, self.hub, self.mgr)
+        self.calls = self.mgr.director.calls
+
+    def tearDown(self) -> None:
+        self.pst.shutdown()
+
+    def test_parse(self) -> None:
+        self.assertEqual(PstRotatorListener.parse("<PST><AZIMUTH>85</AZIMUTH></PST>"),
+                         [("AZIMUTH", "85")])
+        self.assertEqual(PstRotatorListener.parse("<PST>AZ?</PST>"), [("QUERY", "AZ")])
+        self.assertEqual(PstRotatorListener.parse("<PST>TGA?</PST>"), [("QUERY", "TGA")])
+        self.assertEqual(PstRotatorListener.parse("garbage"), [])
+
+    def test_azimuth_stop_park(self) -> None:
+        self.pst.handle("<PST><AZIMUTH>85.4</AZIMUTH></PST>")
+        self.assertEqual(self.calls[-1], ("goto", 85, "pst"))
+        self.pst.handle("<PST><STOP>1</STOP></PST>")
+        self.assertEqual(self.calls[-1], ("stop", "pst"))
+        self.pst.handle("<PST><PARK>1</PARK></PST>")
+        self.assertEqual(self.calls[-1], ("park", "pst"))
+
+    def test_stop_wins_in_same_packet(self) -> None:
+        self.pst.handle("<PST><AZIMUTH>85</AZIMUTH><STOP>1</STOP></PST>")
+        self.assertEqual(self.calls, [("stop", "pst")])
+
+    def test_bad_azimuth_ignored(self) -> None:
+        self.pst.handle("<PST><AZIMUTH>abc</AZIMUTH></PST>")
+        self.pst.handle("<PST><AZIMUTH>999</AZIMUTH></PST>")
+        self.assertEqual(self.calls, [])
+
+    def test_queries(self) -> None:
+        self.assertEqual(self.pst.handle("<PST>AZ?</PST>"), [], "no heading yet")
+        self.hub.publish("heading", {"deg": 84.6})
+        self.assertEqual(self.pst.handle("<PST>AZ?</PST>"), ["AZ:85\r"])
+        self.assertEqual(self.pst.handle("<PST>TGA?</PST>"), ["TGA:85\r"])
+        self.hub.publish("target", {"deg": 200, "source": "web"})
+        self.assertEqual(self.pst.handle("<PST>TGA?</PST>"), ["TGA:200\r"])
+
+
+# --------------------------------------------------------------------------- #
+class ListenerIntegrationTests(unittest.TestCase):
+    """Real sockets, the real director and link, the simulator at a
+    realistic speed so a move is still in progress when it is overridden."""
+
+    def setUp(self) -> None:
+        self.sim = Rt21Simulator(speed=60.0)
+        self.sim.start()
+        self.cfg = Config(host="127.0.0.1", port=self.sim.port,
+                          poll_interval=0.2, stale_timeout=3.0,
+                          n1mm_enabled=True, n1mm_bind="127.0.0.1", n1mm_port=0,
+                          hamlib_enabled=True, hamlib_bind="127.0.0.1", hamlib_port=0,
+                          pst_enabled=True, pst_bind="127.0.0.1", pst_port=0,
+                          hamlib_max_clients=2)
+        self.cfg.transport = "tcp"
+        self.hub = Hub()
+        self.manager = LinkManager(self.cfg, self.hub)
+        self.listeners = ListenerSet(self.cfg, self.hub, self.manager)
+        self.assertEqual(self.listeners.apply(), {})
+        self.manager.connect()
+        self.assertTrue(wait_for(lambda: self.manager.connected), "never connected")
+        self.assertTrue(wait_for(lambda: self.hub.get("heading") is not None))
+        self.sockets: list[socket.socket] = []
+
+    def tearDown(self) -> None:
+        for s in self.sockets:
+            s.close()
+        self.listeners.shutdown()
+        self.manager.disconnect()
+        self.sim.shutdown()
+
+    def hamlib(self) -> socket.socket:
+        port = self.listeners.get("hamlib").port
+        s = socket.create_connection(("127.0.0.1", port), timeout=3.0)
+        self.sockets.append(s)
+        return s
+
+    @staticmethod
+    def ask(s: socket.socket, line: str, lines: int = 1) -> str:
+        s.sendall(line.encode() + b"\n")
+        data = b""
+        while data.count(b"\n") < lines:
+            chunk = s.recv(1024)
+            if not chunk:
+                break
+            data += chunk
+        return data.decode()
+
+    def udp(self) -> socket.socket:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        s.settimeout(3.0)
+        self.sockets.append(s)
+        return s
+
+    def test_override_hamlib_then_n1mm(self) -> None:
+        c = self.hamlib()
+        self.assertEqual(self.ask(c, "P 90 0"), "RPRT 0\n")
+        self.assertTrue(wait_for(lambda: self.hub.get("moving") is True
+                                 or (self.hub.get("heading") or 0) > 5))
+        n1mm = self.udp()
+        n1mm.sendto(N1mmBridgeTests.TURN.replace("45.0", "270.0").encode(),
+                    ("127.0.0.1", self.listeners.get("n1mm").port))
+        self.assertTrue(wait_for(lambda: self.hub.get("target") == 270))
+        self.assertEqual(self.hub.get("target_source"), "n1mm")
+        self.assertTrue(
+            wait_for(lambda: abs(app._shortest_delta(self.hub.get("heading"), 270)) < 2,
+                     timeout=10.0), f"ended at {self.hub.get('heading')}")
+
+    def test_burst_is_coalesced(self) -> None:
+        q = self.hub.subscribe()
+        n1mm = self.udp()
+        port = self.listeners.get("n1mm").port
+        for i in range(20):
+            n1mm.sendto(N1mmBridgeTests.TURN.replace("45.0", f"{100 + i}.0").encode(),
+                        ("127.0.0.1", port))
+            time.sleep(0.005)
+        self.assertTrue(wait_for(lambda: self.hub.get("target") == 119))
+        time.sleep(0.8)
+        sent = []
+        while not q.empty():
+            event, data = q.get_nowait()
+            if event == "traffic" and data["dir"] == "tx" and data["data"].startswith("AP"):
+                sent.append(data["data"])
+        self.hub.unsubscribe(q)
+        self.assertLessEqual(len(sent), 3, sent)
+        self.assertEqual(sent[-1], "AP1119<CR>;")
+
+    def test_hamlib_session_and_client_cap(self) -> None:
+        c = self.hamlib()
+        dump = self.ask(c, "\\dump_state", lines=9)
+        self.assertTrue(dump.endswith("done\n"), dump)
+        pos = self.ask(c, "p", lines=2).split("\n")
+        self.assertEqual(pos[1], "0.00")
+        float(pos[0])
+        self.assertEqual(self.ask(c, "S"), "RPRT 0\n")
+        self.hamlib()
+        self.assertTrue(wait_for(lambda: self.listeners.get("hamlib").client_count == 2))
+        third = self.hamlib()
+        self.assertEqual(third.recv(64), b"", "third client should be refused")
+        self.assertEqual(self.hub.get("listeners")["hamlib"]["clients"], 2)
+
+    def test_hamlib_overlong_line_disconnects(self) -> None:
+        c = self.hamlib()
+        c.sendall(b"P" * 5000)
+        try:
+            self.assertEqual(c.recv(64), b"")
+        except ConnectionResetError:
+            pass                            # closed with unread data -> RST
+        self.assertTrue(self.listeners.get("hamlib").is_alive())
+
+    def test_hamlib_client_drops_mid_line(self) -> None:
+        c = self.hamlib()
+        c.sendall(b"P 12")
+        c.close()
+        self.assertTrue(wait_for(lambda: self.listeners.get("hamlib").client_count == 0))
+        self.assertEqual(self.ask(self.hamlib(), "S"), "RPRT 0\n")
+
+    def test_pst_turn_and_reply_on_port_plus_one(self) -> None:
+        pst = self.listeners.get("pst")
+        reply_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            reply_sock.bind(("127.0.0.1", pst.port + 1))
+        except OSError:
+            reply_sock.close()
+            self.skipTest("port + 1 is taken on this machine")
+        reply_sock.settimeout(3.0)
+        self.sockets.append(reply_sock)
+        sender = self.udp()
+        sender.sendto(b"<PST><AZIMUTH>30</AZIMUTH></PST>", ("127.0.0.1", pst.port))
+        self.assertTrue(wait_for(lambda: self.hub.get("target") == 30))
+        self.assertEqual(self.hub.get("target_source"), "pst")
+        sender.sendto(b"<PST>AZ?</PST>", ("127.0.0.1", pst.port))
+        data, _ = reply_sock.recvfrom(64)
+        self.assertTrue(data.startswith(b"AZ:") and data.endswith(b"\r"), data)
+
+    def test_listener_set_reconfigures_and_reports_port_in_use(self) -> None:
+        self.cfg.pst_enabled = False
+        self.listeners.apply()
+        self.assertIsNone(self.listeners.get("pst"))
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        self.sockets.append(blocker)
+        self.cfg.hamlib_port = blocker.getsockname()[1]
+        errors = self.listeners.apply()
+        self.assertIn("hamlib", errors)
+        self.assertIsNone(self.listeners.get("hamlib"))
+
+    def test_clean_shutdown_with_all_listeners(self) -> None:
+        self.hamlib()
+        threads = [self.listeners.get(k) for k in ("n1mm", "hamlib", "pst")]
+        self.listeners.shutdown()
+        for t in threads:
+            self.assertFalse(t.is_alive(), t.name)
+
+
+class ConfigListenerTests(unittest.TestCase):
+    def test_new_keys_sanitize(self) -> None:
+        cfg = Config(hamlib_bind="bogus", pst_bind="localhost", park_heading="abc",
+                     retarget_mode="wild", hamlib_max_clients=999, pst_port=65535)
+        cfg.sanitize()
+        self.assertEqual(cfg.hamlib_bind, "0.0.0.0")
+        self.assertEqual(cfg.pst_bind, "127.0.0.1")
+        self.assertIsNone(cfg.park_heading)
+        self.assertEqual(cfg.retarget_mode, "stop_first")
+        self.assertEqual(cfg.hamlib_max_clients, 32)
+        self.assertEqual(cfg.pst_port, 65534, "leaves room for the reply port")
+
+    def test_defaults_bind_all_interfaces(self) -> None:
+        cfg = Config()
+        self.assertEqual((cfg.n1mm_bind, cfg.hamlib_bind, cfg.pst_bind),
+                         ("0.0.0.0",) * 3)
+        self.assertFalse(cfg.hamlib_enabled or cfg.pst_enabled)
+        self.assertIsNone(cfg.park_heading)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,7 @@ import os
 import queue
 import re
 import select
+import signal
 import socket
 import sys
 import threading
@@ -65,7 +66,7 @@ from urllib.parse import urlparse
 
 APP_NAME = "RT-21 Controller"
 APP_SLUG = "rt21-controller"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 ORG_NAME = "GreenHeron"
 
 SOH = "\x01"
@@ -93,6 +94,8 @@ CONFIG_DIR = _base_dir("config")
 DATA_DIR = _base_dir("data")
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = DATA_DIR / "logs" / "rt21.log"
+SKINS_DIR = Path(__file__).resolve().parent / "skins"   # shipped dial skins (see docs/skins.md)
+SKIN_ID = re.compile(r"[a-z0-9-]{1,40}")
 
 DEFAULT_PRESETS: list[dict[str, Any]] = [
     {"name": "EU", "heading": 30},
@@ -112,6 +115,20 @@ def _clamp(value: int, low: int, high: int) -> int:
 
 def _clampf(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def _clean_bind(value: Any) -> str:
+    """A listener bind address: an IPv4 literal, else all interfaces."""
+    text = str(value or "").strip()
+    if text in ("", "*"):
+        return "0.0.0.0"
+    if text == "localhost":
+        return "127.0.0.1"
+    try:
+        socket.inet_aton(text)
+    except OSError:
+        return "0.0.0.0"
+    return text
 
 
 @dataclass
@@ -135,10 +152,25 @@ class Config:
     auto_connect_on_start: bool = True
     dark_mode: bool = True
     show_raw_traffic: bool = False
+    skin: str = ""                      # id of a dial skin from skins/skins.json; "" = classic rose
+    skin_overlay: bool = True           # keep drawing ticks and degree labels over a skin
     presets: list[dict[str, Any]] = field(default_factory=lambda: list(DEFAULT_PRESETS))
     http_port: int = 8721               # where this script's own web UI listens
     n1mm_enabled: bool = False          # accept rotator commands from N1MM Logger+
     n1mm_port: int = 12040              # N1MM's fixed rotor broadcast port
+    n1mm_bind: str = "0.0.0.0"          # N1MM usually runs on another PC
+    hamlib_enabled: bool = False        # Hamlib rotctld-compatible TCP server
+    hamlib_bind: str = "0.0.0.0"
+    hamlib_port: int = 4533
+    hamlib_max_clients: int = 4
+    pst_enabled: bool = False           # PstRotator-compatible UDP server
+    pst_bind: str = "0.0.0.0"
+    pst_port: int = 12000               # replies go to the sender on port + 1
+    park_heading: Optional[int] = None  # None = park disabled
+    retarget_mode: str = "stop_first"   # stop_first | direct (mid-move retarget)
+    retarget_settle_ms: int = 3500      # wait after the rotor stops before turning again;
+                                        # must cover the RT-21's DELAYS setting (default 3 s)
+    retarget_min_interval: float = 0.3  # seconds between gotos on the wire
 
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -172,7 +204,30 @@ class Config:
         self.max_heading = _clamp(int(self.max_heading), 359, 719)
         self.http_port = _clamp(int(self.http_port or 8721), 1, 65535)
         self.n1mm_enabled = bool(self.n1mm_enabled)
-        self.n1mm_port = _clamp(int(self.n1mm_port or 12040), 1, 65535)
+        self.n1mm_port = _clamp(int(self.n1mm_port or 12040), 0, 65535)
+        self.n1mm_bind = _clean_bind(self.n1mm_bind)
+        self.hamlib_enabled = bool(self.hamlib_enabled)
+        self.hamlib_bind = _clean_bind(self.hamlib_bind)
+        self.hamlib_port = _clamp(int(self.hamlib_port or 4533), 0, 65535)
+        self.hamlib_max_clients = _clamp(int(self.hamlib_max_clients or 4), 1, 32)
+        self.pst_enabled = bool(self.pst_enabled)
+        self.pst_bind = _clean_bind(self.pst_bind)
+        self.pst_port = _clamp(int(self.pst_port or 12000), 0, 65534)
+        if self.park_heading in (None, ""):
+            self.park_heading = None
+        else:
+            try:
+                self.park_heading = _clamp(int(self.park_heading), 0, self.max_heading)
+            except (TypeError, ValueError):
+                self.park_heading = None
+        if self.retarget_mode not in ("direct", "stop_first"):
+            self.retarget_mode = "stop_first"
+        self.retarget_settle_ms = _clamp(int(self.retarget_settle_ms), 0, 10000)
+        self.retarget_min_interval = _clampf(float(self.retarget_min_interval), 0.0, 5.0)
+        self.skin = str(self.skin or "")
+        if not SKIN_ID.fullmatch(self.skin):
+            self.skin = ""
+        self.skin_overlay = bool(self.skin_overlay)
         if self.transport not in ("auto", "tcp", "ghe"):
             self.transport = "auto"
         if not isinstance(self.presets, list):
@@ -376,7 +431,9 @@ class Hub:
             "heading": None,
             "moving": False,
             "target": None,
+            "target_source": None,
             "version": "",
+            "listeners": {},
         }
         self.console: deque[dict[str, str]] = deque(maxlen=400)
 
@@ -404,6 +461,9 @@ class Hub:
                 self.state["moving"] = bool(data.get("moving"))
             elif event == "target":
                 self.state["target"] = data.get("deg")
+                self.state["target_source"] = data.get("source")
+            elif event == "listeners":
+                self.state["listeners"] = {**self.state["listeners"], **data}
             elif event == "info":
                 self.state["version"] = data.get("text", self.state["version"])
             if event in ("traffic", "info", "log"):
@@ -419,6 +479,10 @@ class Hub:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {**self.state, "console": list(self.console)}
+
+    def get(self, key: str) -> Any:
+        with self._lock:
+            return self.state.get(key)
 
 
 class HubLogHandler(logging.Handler):
@@ -455,10 +519,12 @@ class RotatorLink(threading.Thread):
     reconnects on an exponential backoff and keeps polling.
     """
 
-    def __init__(self, cfg: Config, hub: Hub) -> None:
+    def __init__(self, cfg: Config, hub: Hub,
+                 director: "Optional[MotionDirector]" = None) -> None:
         super().__init__(daemon=True, name="rt21-link")
         self._cfg = cfg
         self._hub = hub
+        self._director = director
         self._proto = Protocol(cfg.unit)
         self._outbox: "queue.Queue[str]" = queue.Queue(maxsize=200)
         self._wake = threading.Event()
@@ -594,7 +660,10 @@ class RotatorLink(threading.Thread):
                     break
                 buffer = self._consume(buffer + chunk.decode("ascii", errors="replace"))
 
-            # transmit anything the UI queued
+            # motion first (latest wins, stop jumps the line), then anything else
+            for command in self._motion_commands():
+                if not self._send(command):
+                    return
             while True:
                 try:
                     command = self._outbox.get_nowait()
@@ -671,6 +740,9 @@ class RotatorLink(threading.Thread):
         # that never answers it must not block heading polls forever.
         version_tries = 3
         while not self._quit.is_set():
+            for command in self._motion_commands():
+                if not self._ghe_send(command):
+                    return
             while True:
                 try:
                     command = self._outbox.get_nowait()
@@ -788,7 +860,15 @@ class RotatorLink(threading.Thread):
         self._hub.publish("traffic", {"dir": "tx", "data": command.replace("\r", "<CR>")})
         return True
 
+    def _motion_commands(self) -> list[str]:
+        if self._director is None:
+            return []
+        return self._director.take(self._proto, self._moving)
+
     def _drain_outbox(self) -> None:
+        """Forget commands queued while the link was down (they are stale)."""
+        if self._director is not None:
+            self._director.discard()
         while True:
             try:
                 self._outbox.get_nowait()
@@ -821,16 +901,22 @@ class LinkManager:
         self._hub = hub
         self._link: Optional[RotatorLink] = None
         self._lock = threading.Lock()
+        self.director = MotionDirector(cfg, hub, self)
 
     @property
     def link(self) -> Optional[RotatorLink]:
         return self._link
 
+    @property
+    def connected(self) -> bool:
+        link = self._link
+        return link is not None and link.connected
+
     def connect(self) -> None:
         with self._lock:
             if self._link is not None and self._link.is_alive():
                 return
-            self._link = RotatorLink(self._cfg, self._hub)
+            self._link = RotatorLink(self._cfg, self._hub, self.director)
             self._link.start()
 
     def disconnect(self) -> None:
@@ -852,52 +938,308 @@ class LinkManager:
 
 
 # --------------------------------------------------------------------------- #
+# Motion director — every command source steers through here; latest wins
+# --------------------------------------------------------------------------- #
+@dataclass
+class Motion:
+    """One motion request waiting for the link thread."""
+
+    kind: str                           # goto | stop | jog
+    source: str                         # web | n1mm | hamlib | pst
+    heading: Optional[int] = None       # goto: wire heading (may exceed 359 on overlap)
+    direction: str = ""                 # jog: cw | ccw
+    stopped_first: bool = False         # stop_first retarget: stop already sent
+    retried: bool = False               # goto re-sent once because nothing moved
+
+
+class MotionDirector:
+    """Arbitrates motion requests from every source: the latest one wins.
+
+    Sources never queue raw RT-21 commands. They fill a single pending slot:
+    a newer goto replaces an older one, and a stop replaces anything. The link
+    thread takes the slot on each pass (every ~0.2 s), so a burst of retargets
+    reaches the controller as one command, and a stop is never stuck behind
+    queued moves.
+    """
+
+    SOURCE_LABELS = {"web": "web UI", "n1mm": "N1MM", "hamlib": "Hamlib",
+                     "pst": "PstRotator"}
+    DUPLICATE_WINDOW = 2.0              # seconds a repeat of the active goto is dropped
+    RECENT_MOTION = 3.0                 # a goto this recent counts as "moving"
+                                        # (status polls over GHE lag ~2 s)
+    STOP_TIMEOUT = 20.0                 # give up waiting for "stopped" after this
+    VERIFY_AFTER = 6.0                  # re-send a goto once if nothing moved by then
+
+    # The RT-21 enforces its DELAYS setting (1-6 s, default 3) before it will
+    # reverse the motor, and ignores a new target that arrives while the motor
+    # is running or inside that delay. So a goto that follows a stop of a
+    # moving rotor waits until the controller reports "stopped", then
+    # retarget_settle_ms more, and a goto that produced no motion at all is
+    # re-sent once.
+
+    def __init__(self, cfg: Config, hub: Hub, manager: "LinkManager") -> None:
+        self._cfg = cfg
+        self._hub = hub
+        self._manager = manager
+        self._lock = threading.Lock()
+        self._pending: Optional[Motion] = None
+        self._active: Optional[Motion] = None   # last goto put on the wire
+        self._active_at = 0.0
+        self._stop_at = 0.0                     # when a stop of a moving rotor went out
+        self._stopped_at = 0.0                  # when the controller then reported stopped
+        self._saw_motion = False                # active goto produced motion?
+        self._heading_at_send: Optional[float] = None
+
+    # -- called from any source thread -------------------------------------- #
+    def goto(self, heading: int, source: str) -> bool:
+        """Request a turn. False if the rotator is not connected."""
+        if not self._manager.connected:
+            return False
+        heading = int(heading)
+        now = time.monotonic()
+        with self._lock:
+            pending = self._pending
+            if pending is not None and pending.kind == "goto" and pending.heading == heading:
+                pending.source = source
+                return True
+            active = self._active
+            if (pending is None and active is not None and active.heading == heading
+                    and (self._hub.get("moving") or now - self._active_at < self.DUPLICATE_WINDOW)):
+                return True                 # already heading there
+            self._pending = Motion("goto", source, heading=heading)
+        prev_deg, prev_src = self._hub.get("target"), self._hub.get("target_source")
+        self._hub.publish("target", {"deg": heading % 360, "source": source})
+        was = ""
+        if prev_deg is not None:
+            was = f" (was {int(prev_deg):03d}° from {self._label(prev_src)})"
+        LOG.info("Target %03d° from %s%s", heading % 360, self._label(source), was)
+        return True
+
+    def stop(self, source: str) -> bool:
+        """Stop now. Replaces anything pending and is sent before it."""
+        if not self._manager.connected:
+            return False
+        with self._lock:
+            self._pending = Motion("stop", source)  # take() retires the active goto
+        self._hub.publish("target", {"deg": None, "source": source})
+        LOG.info("Stop from %s", self._label(source))
+        return True
+
+    def jog(self, direction: str, source: str) -> bool:
+        if direction not in ("cw", "ccw") or not self._manager.connected:
+            return False
+        with self._lock:
+            self._pending = Motion("jog", source, direction=direction)
+            self._active = None
+        self._hub.publish("target", {"deg": None, "source": source})
+        return True
+
+    def park(self, source: str) -> Optional[bool]:
+        """Turn to park_heading. None if park is not configured."""
+        if self._cfg.park_heading is None:
+            return None
+        return self.goto(int(self._cfg.park_heading), source)
+
+    # -- called from the link thread ---------------------------------------- #
+    def take(self, proto: Protocol, moving: bool) -> list[str]:
+        """Return the wire commands for the pending request, if it is due."""
+        now = time.monotonic()
+        with self._lock:
+            if self._active is not None and not self._saw_motion:
+                heading = self._hub.get("heading")
+                if moving or (heading is not None and self._heading_at_send is not None
+                              and abs(_shortest_delta(self._heading_at_send,
+                                                      float(heading))) > 2):
+                    self._saw_motion = True
+            if self._stop_at and not moving and not self._stopped_at:
+                self._stopped_at = now          # first "stopped" status after the stop
+            motion = self._pending
+            if motion is None:
+                return self._verify(proto, moving, now)
+            if motion.kind == "stop":
+                self._pending = None
+                self._note_stop(moving, now)
+                return proto.stop()
+            if motion.kind == "jog":
+                self._pending = None
+                self._stop_at = self._stopped_at = 0.0
+                return [proto.jog_cw() if motion.direction == "cw" else proto.jog_ccw()]
+            # goto
+            if now - self._active_at < self._cfg.retarget_min_interval:
+                return []
+            if (self._cfg.retarget_mode == "stop_first" and not motion.stopped_first
+                    and self._in_motion(moving, now)):
+                motion.stopped_first = True
+                self._note_stop(True, now)
+                LOG.info("Retarget while turning: stopping first, then %03d°",
+                         (motion.heading or 0) % 360)
+                return proto.stop()
+            if not self._settled(now):
+                return []
+            self._pending = None
+            self._stop_at = self._stopped_at = 0.0
+            return self._send_goto(proto, motion, now)
+
+    def _in_motion(self, moving: bool, now: float) -> bool:
+        return self._active is not None and (
+            moving or now - self._active_at < self.RECENT_MOTION)
+
+    def _note_stop(self, moving: bool, now: float) -> None:
+        """A stop is going out; remember it if the rotor may be turning."""
+        if self._in_motion(moving, now) or moving:
+            self._stop_at, self._stopped_at = now, 0.0
+        self._active = None
+
+    def _settled(self, now: float) -> bool:
+        """True once a stopped rotor has sat out the controller's DELAYS."""
+        if not self._stop_at:
+            return True
+        if now - self._stop_at > self.STOP_TIMEOUT:
+            LOG.warning("Controller never reported stopped; sending the new target anyway")
+            return True
+        if not self._stopped_at:
+            return False
+        return now - self._stopped_at >= self._cfg.retarget_settle_ms / 1000.0
+
+    def _send_goto(self, proto: Protocol, motion: Motion, now: float) -> list[str]:
+        self._active = motion
+        self._active_at = now
+        self._saw_motion = False
+        heading = self._hub.get("heading")
+        self._heading_at_send = None if heading is None else float(heading)
+        assert motion.heading is not None
+        # AP1xxx<CR>; slews on its own; AM1; after it is harmless and covers
+        # firmware that treats the AP form as target-only.
+        return [proto.goto(motion.heading), proto.move_to_target()]
+
+    def _verify(self, proto: Protocol, moving: bool, now: float) -> list[str]:
+        """Re-send the active goto once if the rotor never started moving."""
+        active = self._active
+        if (active is None or active.retried or self._saw_motion or moving
+                or now - self._active_at < self.VERIFY_AFTER):
+            return []
+        heading = self._hub.get("heading")
+        if heading is None or abs(_shortest_delta(float(heading),
+                                                  float((active.heading or 0) % 360))) <= 3:
+            active.retried = True               # already there; nothing to do
+            return []
+        active.retried = True
+        LOG.warning("Rotator did not start toward %03d°; re-sending the target",
+                    (active.heading or 0) % 360)
+        self._active_at = now
+        return [proto.goto(active.heading or 0), proto.move_to_target()]
+
+    def discard(self) -> None:
+        """Drop anything pending (the link reconnected; it is stale)."""
+        with self._lock:
+            self._pending = None
+            self._active = None
+            self._stop_at = self._stopped_at = 0.0
+
+    def _label(self, source: Optional[str]) -> str:
+        return self.SOURCE_LABELS.get(source or "", source or "unknown")
+
+
+# --------------------------------------------------------------------------- #
+# Listener plumbing shared by N1MM, Hamlib and PstRotator
+# --------------------------------------------------------------------------- #
+class _Listener(threading.Thread):
+    """Base for the protocol listeners.
+
+    Note: never name a method or attribute _handle, _stop or _started on a
+    Thread subclass — Python 3.13+ uses those names internally.
+
+    Sockets are bound in the constructor, i.e. in the caller's thread, so a
+    port that is already taken fails loudly at startup instead of silently
+    inside a daemon thread. Position queries are answered from the hub, never
+    from the link, so listeners can't compete with the poller for the
+    controller (the GHE box has a single reply buffer).
+    """
+
+    KEY = ""
+
+    def __init__(self, name: str, hub: Hub, manager: "LinkManager") -> None:
+        super().__init__(daemon=True, name=name)
+        self._hub = hub
+        self._manager = manager
+        self._director = manager.director
+        self._quit = threading.Event()
+        self.port = 0
+
+    def _join(self, timeout: float) -> None:
+        if self.ident is not None:          # never started -> nothing to join
+            self.join(timeout)
+
+    def _announce(self, **info: Any) -> None:
+        self._hub.publish("listeners", {self.KEY: info})
+
+
+def _udp_socket(bind: str, port: int) -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((bind, port))
+        sock.settimeout(0.5)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+def _number(text: str) -> Optional[float]:
+    """Parse '245', '245.5' or '245,5'; None for anything else (or NaN/inf)."""
+    try:
+        value = float(text.strip().replace(",", "."))
+    except ValueError:
+        return None
+    return value if value == value and abs(value) != float("inf") else None
+
+
+# --------------------------------------------------------------------------- #
 # N1MM Logger+ bridge — this app acts as N1MM's "rotator program"
 # --------------------------------------------------------------------------- #
-class N1mmBridge(threading.Thread):
+class N1mmBridge(_Listener):
     """Accepts rotator commands from N1MM Logger+ over UDP.
 
     N1MM never speaks the RT-21 protocol itself: when the operator hits
-    Alt+J it broadcasts a small XML datagram on port 12040 (<goazi> to
-    turn, <stop> to stop) and expects a separate rotator program to
-    translate. This thread is that program. Commands feed the same queue
-    the web UI uses — the compass animates N1MM's slews — and the live
-    heading is reported back to the logger on port 13010 as
-    "rotorname @ tenths-of-degrees" (146° -> "mystack @ 1460").
+    Alt+J it broadcasts a small XML datagram on port 12040 and expects a
+    separate rotator program to translate. This thread is that program:
+
+        <N1MMRotor><rotor>mystack</rotor><goazi>146.0</goazi>
+          <offset>0.0</offset><bidirectional>0</bidirectional>
+          <freqband>14.0</freqband></N1MMRotor>
+        <N1MMRotor><stop><rotor>mystack</rotor><freqband>14.0</freqband>
+          </stop></N1MMRotor>
+
+    The live heading is reported back to the logger on port 13010 as
+    "rotorname @ tenths-of-degrees" (146° -> "mystack @ 1460"); the name
+    must match N1MM's rotor name or the logger ignores the report.
 
     The socket accepts datagrams from any machine on the network (that is
     the point — N1MM runs on a Windows box elsewhere in the shack), so the
     bridge is off unless --n1mm or the n1mm_enabled config key turns it on.
     """
 
-    _GOAZI = re.compile(r"<goazi>\s*(-?[0-9]+(?:[.,][0-9]+)?)\s*</goazi>")
-    _OFFSET = re.compile(r"<offset>\s*(-?[0-9]+(?:[.,][0-9]+)?)\s*</offset>")
-    _NAME = re.compile(r"<rotorname>\s*(.*?)\s*</rotorname>", re.S)
-    _STOP = re.compile(r"<stop\b")
+    KEY = "n1mm"
+    _GOAZI = re.compile(r"<goazi>\s*(-?[0-9]+(?:[.,][0-9]+)?)\s*</goazi>", re.I)
+    _OFFSET = re.compile(r"<offset>\s*(-?[0-9]+(?:[.,][0-9]+)?)\s*</offset>", re.I)
+    # Real packets carry <rotor>name</rotor>; older fixtures used <rotorname>.
+    _NAME = re.compile(r"<rotorname>\s*(.*?)\s*</rotorname>|<rotor>\s*([^<]*?)\s*</rotor>",
+                       re.S | re.I)
+    _BIDIR = re.compile(r"<bidirectional>\s*(1|true)\s*</bidirectional>", re.I)
+    _STOP = re.compile(r"<stop\b", re.I)
 
     FEEDBACK_PERIOD = 2.0               # seconds between heading reports
 
-    def __init__(self, cfg: Config, hub: Hub, manager: LinkManager,
+    def __init__(self, cfg: Config, hub: Hub, manager: "LinkManager",
                  feedback_port: int = 13010) -> None:
-        super().__init__(daemon=True, name="n1mm-bridge")
+        super().__init__("n1mm-bridge", hub, manager)
         self._cfg = cfg
-        self._hub = hub
-        self._manager = manager
         self._feedback_port = feedback_port
-        self._quit = threading.Event()
         self._peer: Optional[str] = None    # IP of the N1MM we last heard from
         self._rotor_name = ""               # echoed back in heading reports
         self._last_feedback = 0.0
-        # Bind in the caller's thread so a taken port fails loudly at startup
-        # instead of silently inside a daemon thread.
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._sock.bind(("", cfg.n1mm_port))
-            self._sock.settimeout(0.5)
-        except OSError:
-            self._sock.close()
-            raise
+        self._sock = _udp_socket(cfg.n1mm_bind, cfg.n1mm_port)
         self.port = self._sock.getsockname()[1]
 
     def shutdown(self, timeout: float = 2.0) -> None:
@@ -906,12 +1248,12 @@ class N1mmBridge(threading.Thread):
             self._sock.close()
         except OSError:
             pass
-        self.join(timeout)
+        self._join(timeout)
 
     def run(self) -> None:
-        LOG.info("N1MM bridge: listening on UDP port %d (any machine on the "
-                 "network can turn the rotator); heading reports go to port %d",
-                 self.port, self._feedback_port)
+        LOG.info("N1MM bridge: listening on UDP %s:%d; heading reports go to port %d",
+                 self._cfg.n1mm_bind, self.port, self._feedback_port)
+        self._announce(port=self.port, bind=self._cfg.n1mm_bind)
         while not self._quit.is_set():
             try:
                 data, addr = self._sock.recvfrom(2048)
@@ -920,44 +1262,68 @@ class N1mmBridge(threading.Thread):
             except OSError:
                 break                       # socket closed by shutdown()
             else:
-                self._handle(data, addr[0])
+                try:
+                    self._on_datagram(data, addr[0])
+                except Exception:           # a bad packet must never kill the thread
+                    LOG.exception("N1MM: error handling datagram from %s", addr[0])
             self._send_feedback()
         LOG.info("N1MM bridge stopped")
 
-    def _handle(self, data: bytes, sender: str) -> None:
+    @classmethod
+    def parse(cls, text: str) -> dict[str, Any]:
+        """Pure parser: {'name', 'stop', 'azimuth', 'offset', 'bidirectional'}."""
+        out: dict[str, Any] = {"name": None, "stop": bool(cls._STOP.search(text)),
+                               "azimuth": None, "offset": 0.0,
+                               "bidirectional": bool(cls._BIDIR.search(text))}
+        match = cls._NAME.search(text)
+        if match:
+            out["name"] = (match.group(1) if match.group(1) is not None
+                           else match.group(2))[:32]
+        match = cls._GOAZI.search(text)
+        if match:
+            out["azimuth"] = _number(match.group(1))
+        match = cls._OFFSET.search(text)
+        if match:
+            out["offset"] = _number(match.group(1)) or 0.0
+        return out
+
+    def resolve_heading(self, azimuth: float, offset: float, bidirectional: bool) -> int:
+        """Apply the offset; for a bidirectional antenna pick the nearer end."""
+        heading = (azimuth + offset) % 360.0
+        current = self._hub.get("heading")
+        if bidirectional and current is not None:
+            reverse = (heading + 180.0) % 360.0
+            if abs(_shortest_delta(float(current), reverse)) < \
+                    abs(_shortest_delta(float(current), heading)):
+                heading = reverse
+        return int(round(heading)) % 360
+
+    def _on_datagram(self, data: bytes, sender: str) -> None:
         text = data.decode("utf-8", "replace")
         self._peer = sender
-        match = self._NAME.search(text)
-        if match:
-            self._rotor_name = match.group(1)[:32]
-        if self._STOP.search(text):
-            ok = self._manager.submit(self._manager.protocol().stop())
-            if ok:
-                self._hub.publish("target", {"deg": None})
-            LOG.info("N1MM: stop%s", "" if ok else " (rotator not connected — ignored)")
+        packet = self.parse(text)
+        if packet["name"]:
+            self._rotor_name = packet["name"]
+        if packet["stop"]:
+            ok = self._director.stop("n1mm")
+            if not ok:
+                LOG.info("N1MM: stop (rotator not connected — ignored)")
             return
-        match = self._GOAZI.search(text)
-        if match is None:
+        if packet["azimuth"] is None:
             LOG.debug("N1MM: unrecognized datagram from %s: %r", sender, text[:120])
             return
-        azimuth = float(match.group(1).replace(",", "."))
-        offmatch = self._OFFSET.search(text)
-        offset = float(offmatch.group(1).replace(",", ".")) if offmatch else 0.0
-        heading = round(azimuth + offset) % 360
-        proto = self._manager.protocol()
-        ok = self._manager.submit([proto.goto(heading), proto.move_to_target()])
-        if ok:
-            self._hub.publish("target", {"deg": heading})
-        LOG.info("N1MM: turn to %03d°%s", heading,
-                 "" if ok else " (rotator not connected — ignored)")
+        heading = self.resolve_heading(packet["azimuth"], packet["offset"],
+                                       packet["bidirectional"])
+        if not self._director.goto(heading, "n1mm"):
+            LOG.info("N1MM: turn to %03d° (rotator not connected — ignored)", heading)
         self._last_feedback = 0.0           # answer with a heading right away
 
     def _send_feedback(self) -> None:
         now = time.monotonic()
         if self._peer is None or now - self._last_feedback < self.FEEDBACK_PERIOD:
             return
-        heading = self._hub.state["heading"]    # single-value read; a stale
-        if heading is None:                     # snapshot is harmless here
+        heading = self._hub.get("heading")
+        if heading is None:
             return
         message = f"{self._rotor_name or 'rotor'} @ {int(round(float(heading) * 10))}"
         try:
@@ -966,6 +1332,408 @@ class N1mmBridge(threading.Thread):
             self._last_feedback = now
         except OSError:
             pass                            # feedback is best-effort
+
+
+# --------------------------------------------------------------------------- #
+# Hamlib rotctld-compatible TCP server
+# --------------------------------------------------------------------------- #
+class HamlibListener(_Listener):
+    """Speaks the rotctld network protocol, so any Hamlib client can steer.
+
+    Tested shapes follow Hamlib's tests/rotctl_parse.c: one command per line,
+    short (``P 180 0``) or long (``\\set_pos 180 0``) form, optional ``+`` or
+    punctuation prefix for the extended response protocol. Replies are
+    ``RPRT n`` for set commands and bare values for queries. Elevation is
+    accepted and ignored; ``p`` always reports 0.
+
+        rotctl -m 2 -r <this-host>:4533
+    """
+
+    KEY = "hamlib"
+    MAX_LINE = 1024
+    ROT_MODEL = 2                       # what rotctld reports; netrotctl ignores it
+
+    # Hamlib error codes (negated in replies)
+    EINVAL, ENIMPL, EIO, ENAVAIL = 1, 4, 6, 11
+
+    LONG_NAMES = {"set_pos": "P", "get_pos": "p", "stop": "S", "park": "K",
+                  "move": "M", "get_info": "_", "dump_state": "dump_state",
+                  "quit": "q", "exit": "q"}
+    SHORT_NAMES = {"P": "set_pos", "p": "get_pos", "S": "stop", "K": "park",
+                   "M": "move", "_": "get_info", "dump_state": "dump_state"}
+
+    def __init__(self, cfg: Config, hub: Hub, manager: "LinkManager") -> None:
+        super().__init__("hamlib-rotctld", hub, manager)
+        self._cfg = cfg
+        self._clients: dict[socket.socket, str] = {}
+        self._clients_lock = threading.Lock()
+        self._threads: list[threading.Thread] = []
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind((cfg.hamlib_bind, cfg.hamlib_port))
+            self._sock.listen(8)
+            self._sock.settimeout(0.5)
+        except OSError:
+            self._sock.close()
+            raise
+        self.port = self._sock.getsockname()[1]
+
+    @property
+    def client_count(self) -> int:
+        with self._clients_lock:
+            return len(self._clients)
+
+    def shutdown(self, timeout: float = 2.0) -> None:
+        self._quit.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        with self._clients_lock:
+            clients = list(self._clients)
+        for conn in clients:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self._join(timeout)
+        for thread in list(self._threads):
+            thread.join(timeout)
+
+    def run(self) -> None:
+        LOG.info("Hamlib rotctld: listening on TCP %s:%d (max %d clients)",
+                 self._cfg.hamlib_bind, self.port, self._cfg.hamlib_max_clients)
+        self._announce(port=self.port, bind=self._cfg.hamlib_bind, clients=0)
+        while not self._quit.is_set():
+            try:
+                conn, addr = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            peer = f"{addr[0]}:{addr[1]}"
+            with self._clients_lock:
+                full = len(self._clients) >= self._cfg.hamlib_max_clients
+                if not full:
+                    self._clients[conn] = peer
+            if full:
+                LOG.warning("Hamlib: refusing %s — %d clients already connected",
+                            peer, self._cfg.hamlib_max_clients)
+                conn.close()
+                continue
+            thread = threading.Thread(target=self._serve, args=(conn, peer),
+                                      daemon=True, name=f"hamlib-{peer}")
+            self._threads = [t for t in self._threads if t.is_alive()] + [thread]
+            thread.start()
+        LOG.info("Hamlib rotctld stopped")
+
+    def _serve(self, conn: socket.socket, peer: str) -> None:
+        LOG.info("Hamlib: client %s connected", peer)
+        self._announce(port=self.port, bind=self._cfg.hamlib_bind, clients=self.client_count)
+        try:
+            conn.settimeout(0.5)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            buffer = b""
+            while not self._quit.is_set():
+                try:
+                    chunk = conn.recv(1024)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    reply, close = self.handle_line(raw.decode("ascii", "replace"))
+                    if reply:
+                        conn.sendall(reply.encode("ascii", "replace"))
+                    if close:
+                        return
+                if len(buffer) > self.MAX_LINE:
+                    LOG.warning("Hamlib: %s sent an over-long line; disconnecting", peer)
+                    return
+        except OSError:
+            pass
+        finally:
+            with self._clients_lock:
+                self._clients.pop(conn, None)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            LOG.info("Hamlib: client %s disconnected", peer)
+            if not self._quit.is_set():
+                self._announce(port=self.port, bind=self._cfg.hamlib_bind,
+                               clients=self.client_count)
+
+    # -- protocol (pure apart from the director/hub calls) ------------------ #
+    def handle_line(self, line: str) -> tuple[str, bool]:
+        """Execute one rotctld command line. Returns (reply, close_connection)."""
+        line = line.strip("\r\n\t ")
+        if not line:
+            return "", False
+        ext, sep = False, "\n"
+        if line[0] == "+":
+            ext, line = True, line[1:]
+        elif line[0] not in "\\_#" and not line[0].isalnum():
+            ext, sep, line = True, line[0], line[1:]
+        line = line.lstrip()
+        if not line:
+            return "", False
+        if line[0] == "\\":
+            name, _, rest = line[1:].partition(" ")
+            cmd = self.LONG_NAMES.get(name)
+        else:
+            cmd, rest = line[0], line[1:]
+        args = rest.split()
+        if cmd in ("q", "Q"):
+            return "", True
+        if cmd is None or cmd not in self.SHORT_NAMES:
+            code, values = -self.ENIMPL, []
+        else:
+            code, values = self._execute(cmd, args, ext)
+        if not ext:
+            if code != 0:
+                return f"RPRT {code}\n", False
+            if values:
+                return "".join(v + sep for v in values), False
+            return "RPRT 0\n", False
+        header = f"{self.SHORT_NAMES.get(cmd or '', cmd or '?')}:" + "".join(" " + a for a in args)
+        body = "".join(v + sep for v in values) if code == 0 else ""
+        return f"{header}{sep}{body}RPRT {code}\n", False
+
+    def _execute(self, cmd: str, args: list[str], ext: bool) -> tuple[int, list[str]]:
+        max_az = 360.0 if self._cfg.max_heading <= 359 else float(self._cfg.max_heading)
+        if cmd == "P":
+            if not args:
+                return -self.EINVAL, []
+            az = _number(args[0])
+            if az is None:
+                return -self.EINVAL, []
+            if -180.0 <= az < 0:
+                az += 360.0
+            if not 0.0 <= az <= max_az:
+                return -self.EINVAL, []
+            heading = int(round(az))
+            if heading > self._cfg.max_heading:
+                heading %= 360
+            return (0 if self._director.goto(heading, "hamlib") else -self.EIO), []
+        if cmd == "p":
+            heading = self._hub.get("heading")
+            if heading is None:
+                return -self.EIO, []
+            az, el = f"{float(heading):.2f}", "0.00"
+            return 0, ([f"Azimuth: {az}", f"Elevation: {el}"] if ext else [az, el])
+        if cmd == "S":
+            return (0 if self._director.stop("hamlib") else -self.EIO), []
+        if cmd == "K":
+            parked = self._director.park("hamlib")
+            if parked is None:
+                return -self.ENAVAIL, []
+            return (0 if parked else -self.EIO), []
+        if cmd == "M":
+            if not args:
+                return -self.EINVAL, []
+            word = args[0].upper()
+            direction = {"LEFT": "ccw", "CCW": "ccw", "8": "ccw",
+                         "RIGHT": "cw", "CW": "cw", "16": "cw"}.get(word)
+            if direction is None:
+                return (-self.ENIMPL if word.isalpha() or word.isdigit() else -self.EINVAL), []
+            return (0 if self._director.jog(direction, "hamlib") else -self.EIO), []
+        if cmd == "_":
+            version = self._hub.get("version") or "RT-21"
+            info = f"{version} via {APP_NAME} {APP_VERSION}"
+            return 0, [f"Info: {info}" if ext else info]
+        if cmd == "dump_state":
+            return 0, ["1", str(self.ROT_MODEL),
+                       "min_az=0.000000", f"max_az={max_az:.6f}",
+                       "min_el=0.000000", "max_el=90.000000",
+                       "south_zero=0", "rot_type=Az", "done"]
+        return -self.ENIMPL, []
+
+
+# --------------------------------------------------------------------------- #
+# PstRotator-compatible UDP server
+# --------------------------------------------------------------------------- #
+class PstRotatorListener(_Listener):
+    """Accepts PstRotator's UDP control messages.
+
+        <PST><AZIMUTH>85</AZIMUTH></PST>     turn to 85°
+        <PST><STOP>1</STOP></PST>            stop
+        <PST><PARK>1</PARK></PST>            park (only if park_heading is set)
+        <PST>AZ?</PST>   ->  "AZ:85<CR>"     current heading
+        <PST>TGA?</PST>  ->  "TGA:85<CR>"    current target
+
+    Replies go to the sender's address on this listener's port + 1 (12001 by
+    default), as PstRotator does. Several tags may share one datagram; a
+    STOP in the packet wins over an AZIMUTH in the same packet.
+    """
+
+    KEY = "pst"
+    _TAG = re.compile(r"<(AZIMUTH|STOP|PARK|TRACK|ON|QRA|ANT|STF|STR|ELEVATION)>"
+                      r"\s*(.*?)\s*</\1>", re.I | re.S)
+    _QUERY = re.compile(r"\b(AZ|TGA|EL)\?", re.I)
+
+    def __init__(self, cfg: Config, hub: Hub, manager: "LinkManager",
+                 reply_port: Optional[int] = None) -> None:
+        super().__init__("pstrotator", hub, manager)
+        self._cfg = cfg
+        self._sock = _udp_socket(cfg.pst_bind, cfg.pst_port)
+        self.port = self._sock.getsockname()[1]
+        self.reply_port = reply_port if reply_port is not None else self.port + 1
+
+    def shutdown(self, timeout: float = 2.0) -> None:
+        self._quit.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._join(timeout)
+
+    def run(self) -> None:
+        LOG.info("PstRotator: listening on UDP %s:%d; replies go to port %d",
+                 self._cfg.pst_bind, self.port, self.reply_port)
+        self._announce(port=self.port, bind=self._cfg.pst_bind)
+        while not self._quit.is_set():
+            try:
+                data, addr = self._sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                for reply in self.handle(data.decode("utf-8", "replace")):
+                    try:
+                        self._sock.sendto(reply.encode("ascii"), (addr[0], self.reply_port))
+                    except OSError:
+                        pass
+            except Exception:
+                LOG.exception("PstRotator: error handling datagram from %s", addr[0])
+        LOG.info("PstRotator stopped")
+
+    @classmethod
+    def parse(cls, text: str) -> list[tuple[str, str]]:
+        """Pure parser: [(TAG, value)] plus ('QUERY', 'AZ'|'TGA'|'EL')."""
+        if "<PST>" not in text.upper():
+            return []
+        items = [(m.group(1).upper(), m.group(2)) for m in cls._TAG.finditer(text)]
+        stripped = cls._TAG.sub("", text)
+        items += [("QUERY", m.group(1).upper()) for m in cls._QUERY.finditer(stripped)]
+        return items
+
+    def handle(self, text: str) -> list[str]:
+        """Execute one datagram; return the replies to send."""
+        items = self.parse(text)
+        if not items:
+            LOG.debug("PstRotator: ignored %r", text[:120])
+            return []
+        replies: list[str] = []
+        tags = dict(items)
+        if "STOP" in tags and tags["STOP"].strip() == "1":
+            if not self._director.stop("pst"):
+                LOG.info("PstRotator: stop (rotator not connected — ignored)")
+        elif "PARK" in tags and tags["PARK"].strip() == "1":
+            parked = self._director.park("pst")
+            if parked is None:
+                LOG.info("PstRotator: park ignored — no park heading configured")
+        elif "AZIMUTH" in tags:
+            az = _number(tags["AZIMUTH"])
+            if az is None or not 0.0 <= az <= max(360.0, float(self._cfg.max_heading)):
+                LOG.info("PstRotator: bad azimuth %r ignored", tags["AZIMUTH"][:16])
+            else:
+                heading = int(round(az))
+                if heading > self._cfg.max_heading:
+                    heading %= 360
+                if not self._director.goto(heading, "pst"):
+                    LOG.info("PstRotator: turn to %03d° (rotator not connected — ignored)",
+                             heading)
+        for tag, value in items:
+            if tag == "QUERY":
+                key = {"AZ": "heading", "TGA": "target"}.get(value)
+                if key is None:
+                    replies.append(f"{value}:0\r")      # EL: azimuth-only rotator
+                    continue
+                deg = self._hub.get(key)
+                if key == "target" and deg is None:
+                    deg = self._hub.get("heading")
+                if deg is not None:
+                    replies.append(f"{value}:{int(round(float(deg))) % 360}\r")
+            elif tag not in ("AZIMUTH", "STOP", "PARK"):
+                LOG.debug("PstRotator: %s not supported — ignored", tag)
+        return replies
+
+
+class ListenerSet:
+    """Starts and stops the protocol listeners to match the configuration.
+
+    apply() can be called at startup and after every settings change: a
+    listener whose enabled flag, bind address or port changed is restarted,
+    one that was switched off is shut down. A port that is taken is logged
+    and reported, never fatal.
+    """
+
+    def __init__(self, cfg: Config, hub: Hub, manager: LinkManager) -> None:
+        self._cfg = cfg
+        self._hub = hub
+        self._manager = manager
+        self._lock = threading.Lock()
+        self._running: dict[str, tuple[tuple, Any]] = {}
+
+    def _wanted(self) -> dict[str, tuple]:
+        cfg = self._cfg
+        return {
+            "n1mm": (cfg.n1mm_enabled, cfg.n1mm_bind, cfg.n1mm_port),
+            "hamlib": (cfg.hamlib_enabled, cfg.hamlib_bind, cfg.hamlib_port,
+                       cfg.hamlib_max_clients),
+            "pst": (cfg.pst_enabled, cfg.pst_bind, cfg.pst_port),
+        }
+
+    def _make(self, key: str) -> Any:
+        if key == "n1mm":
+            return N1mmBridge(self._cfg, self._hub, self._manager)
+        if key == "hamlib":
+            return HamlibListener(self._cfg, self._hub, self._manager)
+        return PstRotatorListener(self._cfg, self._hub, self._manager)
+
+    def get(self, key: str) -> Any:
+        with self._lock:
+            entry = self._running.get(key)
+        return entry[1] if entry else None
+
+    def apply(self) -> dict[str, str]:
+        """Reconcile running listeners with the config. Returns bind errors."""
+        errors: dict[str, str] = {}
+        with self._lock:
+            for key, spec in self._wanted().items():
+                current = self._running.get(key)
+                if current is not None and current[0] == spec:
+                    continue
+                if current is not None:
+                    current[1].shutdown()
+                    del self._running[key]
+                    self._hub.publish("listeners", {key: None})
+                if not spec[0]:
+                    continue
+                try:
+                    listener = self._make(key)
+                except OSError as exc:
+                    errors[key] = str(exc.strerror or exc)
+                    LOG.error("%s listener disabled — cannot bind %s:%s: %s",
+                              key, spec[1], spec[2], errors[key])
+                    self._hub.publish("listeners", {key: {"error": errors[key]}})
+                    continue
+                listener.start()
+                self._running[key] = (spec, listener)
+        return errors
+
+    def shutdown(self) -> None:
+        with self._lock:
+            running, self._running = self._running, {}
+        for _, listener in running.values():
+            listener.shutdown()
 
 
 # --------------------------------------------------------------------------- #
@@ -984,11 +1752,11 @@ class Rt21Simulator(threading.Thread):
         self._speed = speed
         self._heading = 0.0
         self._target = 0.0
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self._clients: list[socket.socket] = []
 
     def shutdown(self) -> None:
-        self._stop.set()
+        self._halt.set()
         for client in list(self._clients):
             try:
                 client.shutdown(socket.SHUT_RDWR)
@@ -1005,7 +1773,7 @@ class Rt21Simulator(threading.Thread):
             pass
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 conn, _ = self._server.accept()
             except OSError:
@@ -1018,7 +1786,7 @@ class Rt21Simulator(threading.Thread):
         buffer = ""
         last = time.monotonic()
         with conn:
-            while not self._stop.is_set():
+            while not self._halt.is_set():
                 now = time.monotonic()
                 self._advance(now - last)
                 last = now
@@ -1033,7 +1801,7 @@ class Rt21Simulator(threading.Thread):
                     return
                 while ";" in buffer:
                     frame, buffer = buffer.split(";", 1)
-                    reply = self._handle(frame.strip("\r\n "))
+                    reply = self._reply(frame.strip("\r\n "))
                     if reply:
                         try:
                             conn.sendall(reply.encode("ascii"))
@@ -1048,7 +1816,7 @@ class Rt21Simulator(threading.Thread):
         step = min(abs(delta), self._speed * elapsed)
         self._heading = (self._heading + step * (1 if delta > 0 else -1)) % 360.0
 
-    def _handle(self, frame: str) -> str:
+    def _reply(self, frame: str) -> str:
         moving = abs(_shortest_delta(self._heading, self._target)) >= 0.5
         if frame == "":
             self._target = self._heading
@@ -1080,13 +1848,38 @@ class Rt21Simulator(threading.Thread):
 # --------------------------------------------------------------------------- #
 # HTTP server + API
 # --------------------------------------------------------------------------- #
+def load_skins(directory: Path = SKINS_DIR) -> list[dict[str, str]]:
+    """The skins that are both listed in skins.json and present on disk.
+
+    Only ids from this list are ever served, so a request can never name an
+    arbitrary file. A missing or broken index just means no skins.
+    """
+    try:
+        entries = json.loads((directory / "skins.json").read_text(encoding="utf-8"))["skins"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    skins = []
+    for e in entries:
+        try:
+            sid, image = str(e["id"]), str(e["image"])
+        except (KeyError, TypeError):
+            continue
+        if SKIN_ID.fullmatch(sid) and image == f"{sid}.webp" and (directory / image).is_file():
+            skins.append({"id": sid, "name": str(e.get("name", sid)),
+                          "credit": str(e.get("credit", "")), "license": str(e.get("license", "")),
+                          "source": str(e.get("source", ""))})
+    return skins
+
+
 class AppContext:
     """What the HTTP handlers need: config, hub, link manager."""
 
-    def __init__(self, cfg: Config, hub: Hub, manager: LinkManager) -> None:
+    def __init__(self, cfg: Config, hub: Hub, manager: LinkManager,
+                 listeners: "Optional[ListenerSet]" = None) -> None:
         self.cfg = cfg
         self.hub = hub
         self.manager = manager
+        self.listeners = listeners
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1141,12 +1934,28 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             elif path == "/api/state":
                 self._json(200, self._state_payload())
+            elif path == "/api/skins":
+                self._json(200, {"skins": load_skins()})
+            elif path.startswith("/skins/") and path.endswith(".webp"):
+                self._serve_skin(path[len("/skins/"):-len(".webp")])
             elif path == "/events":
                 self._serve_events()
             else:
                 self._json(404, {"error": "not found"})
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def _serve_skin(self, skin_id: str) -> None:
+        if not any(s["id"] == skin_id for s in load_skins()):
+            self._json(404, {"error": "no such skin"})
+            return
+        body = (SKINS_DIR / f"{skin_id}.webp").read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/webp")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _state_payload(self) -> dict[str, Any]:
         cfg = self.ctx.cfg
@@ -1160,8 +1969,18 @@ class Handler(BaseHTTPRequestHandler):
                 "presets": cfg.presets,
                 "dark_mode": cfg.dark_mode,
                 "show_raw_traffic": cfg.show_raw_traffic,
+                "skin": cfg.skin,
+                "skin_overlay": cfg.skin_overlay,
                 "poll_interval": cfg.poll_interval,
                 "transport": cfg.transport,
+                "n1mm_enabled": cfg.n1mm_enabled,
+                "hamlib_enabled": cfg.hamlib_enabled,
+                "hamlib_port": cfg.hamlib_port,
+                "pst_enabled": cfg.pst_enabled,
+                "pst_port": cfg.pst_port,
+                "park_heading": cfg.park_heading,
+                "retarget_mode": cfg.retarget_mode,
+                "retarget_settle_ms": cfg.retarget_settle_ms,
             },
             "app": {"name": APP_NAME, "version": APP_VERSION},
         }
@@ -1211,17 +2030,14 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/goto":
                 self._handle_goto(body)
             elif path == "/api/stop":
-                ok = ctx.manager.submit(ctx.manager.protocol().stop())
-                ctx.hub.publish("target", {"deg": None})
+                ok = ctx.manager.director.stop("web")
                 self._json(200 if ok else 409, {"ok": ok})
             elif path == "/api/jog":
-                proto = ctx.manager.protocol()
                 direction = str(body.get("dir", ""))
                 if direction not in ("cw", "ccw"):
                     self._json(400, {"error": "dir must be cw or ccw"})
                     return
-                cmd = proto.jog_cw() if direction == "cw" else proto.jog_ccw()
-                ok = ctx.manager.submit(cmd)
+                ok = ctx.manager.director.jog(direction, "web")
                 self._json(200 if ok else 409, {"ok": ok})
             elif path == "/api/config":
                 self._handle_config(body)
@@ -1240,13 +2056,7 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 <= heading <= ctx.cfg.max_heading:
             self._json(400, {"error": f"heading must be 0–{ctx.cfg.max_heading}"})
             return
-        # AP1xxx<CR>; slews on its own; AM1; after it is harmless and covers
-        # firmware that treats the AP form as target-only (Green Heron's own
-        # web client sends the same pair).
-        proto = ctx.manager.protocol()
-        ok = ctx.manager.submit([proto.goto(heading), proto.move_to_target()])
-        if ok:
-            ctx.hub.publish("target", {"deg": heading % 360})
+        ok = ctx.manager.director.goto(heading, "web")
         self._json(200 if ok else 409, {"ok": ok, "heading": heading})
 
     def _handle_config(self, body: dict[str, Any]) -> None:
@@ -1256,7 +2066,14 @@ class Handler(BaseHTTPRequestHandler):
             "host": str, "port": int, "unit": int, "max_heading": int,
             "presets": list, "dark_mode": bool, "show_raw_traffic": bool,
             "poll_interval": float, "auto_reconnect": bool, "transport": str,
+            "n1mm_enabled": bool, "hamlib_enabled": bool, "hamlib_port": int,
+            "pst_enabled": bool, "pst_port": int, "retarget_mode": str,
+            "retarget_settle_ms": int, "skin": str, "skin_overlay": bool,
+            "park_heading": lambda v: None if v in (None, "") else int(v),
         }
+        if body.get("skin") and not any(s["id"] == body["skin"] for s in load_skins()):
+            self._json(400, {"error": "unknown skin"})
+            return
         changed = []
         for key, cast in allowed.items():
             if key in body:
@@ -1274,6 +2091,15 @@ class Handler(BaseHTTPRequestHandler):
                 link.protocol.unit = cfg.unit
         self.ctx.hub.publish("config", self._state_payload()["config"])
         LOG.info("Configuration updated (%s)", ", ".join(changed) or "no changes")
+        errors: dict[str, str] = {}
+        if self.ctx.listeners is not None and {
+                "n1mm_enabled", "hamlib_enabled", "hamlib_port",
+                "pst_enabled", "pst_port"} & set(changed):
+            errors = self.ctx.listeners.apply()
+        if errors:
+            self._json(409, {"ok": False, "changed": changed,
+                             "error": "; ".join(f"{k}: {v}" for k, v in errors.items())})
+            return
         self._json(200, {"ok": True, "changed": changed})
 
 
@@ -1407,7 +2233,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
     border: 1px solid var(--line); border-radius: 8px; padding: 8px;
   }
   dialog .hint { grid-column: 1 / -1; color: var(--dim); font-size: 12.5px; }
-  dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  #skinDlg { width: min(640px, 94vw); }
+  .skins { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 10px; }
+  .skin { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px;
+          font-size: 12.5px; text-align: center; line-height: 1.2; }
+  .skin img, .skin .none { width: 84px; height: 84px; border-radius: 50%; object-fit: cover;
+          border: 2px solid var(--line); background: var(--panel2); }
+  .skin .none { display: grid; place-items: center; color: var(--dim); font-size: 28px; }
+  .skin[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .skin[aria-pressed="true"] img, .skin[aria-pressed="true"] .none { border-color: var(--accent); }
+  #skinCredit { grid-column: auto; color: var(--dim); font-size: 12.5px; margin-top: 10px; min-height: 2.6em; }
+  #skinCredit a { color: var(--dim); }
+  dialog .actions { flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
   .footrow { display: flex; gap: 14px; align-items: center; color: var(--dim); font-size: 12.5px;
              flex-wrap: wrap; padding: 0 4px; }
   .footrow a { color: var(--dim); cursor: pointer; text-decoration: underline; }
@@ -1421,6 +2258,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <span id="statusDetail">Connecting to controller…</span>
     <span class="spacer"></span>
     <button id="connBtn">Connect</button>
+    <button id="skinBtn" title="Choose a dial skin">Skins</button>
     <button id="settingsBtn" title="Settings">⚙︎</button>
     <button id="themeBtn" title="Toggle theme">◐</button>
   </header>
@@ -1463,11 +2301,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="footrow">
     <span id="verInfo"></span>
     <span id="connInfo"></span>
+    <span id="listenInfo"></span>
     <a id="consoleToggle">console</a>
     <span style="flex:1"></span>
     <span>Esc stop · Enter go · drag the rose to point</span>
   </div>
 </div>
+
+<dialog id="skinDlg">
+  <h2>Dial skin</h2>
+  <div class="skins" id="skinGrid"></div>
+  <div id="skinCredit"></div>
+  <label style="display:block;margin-top:8px"><input type="checkbox" id="skinOverlay">
+    Overlay degree scale and labels</label>
+  <div class="actions"><button id="skinDone" class="primary">Done</button></div>
+</dialog>
 
 <dialog id="settingsDlg">
   <h2>Settings</h2>
@@ -1482,6 +2330,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <label>Unit digit</label><input type="number" id="setUnit" min="0" max="9">
     <label>Max heading</label><input type="number" id="setMax" min="359" max="719">
     <label>Poll interval (s)</label><input type="number" id="setPoll" min="0.2" max="10" step="0.1">
+    <label>N1MM Logger+</label><span><input type="checkbox" id="setN1mm"> UDP 12040</span>
+    <label>Hamlib rotctld</label><span><input type="checkbox" id="setHamlib"> TCP port
+      <input type="number" id="setHamlibPort" min="1" max="65535" style="width:90px"></span>
+    <label>PstRotator</label><span><input type="checkbox" id="setPst"> UDP port
+      <input type="number" id="setPstPort" min="1" max="65534" style="width:90px"></span>
+    <label>Park heading</label><input type="number" id="setPark" min="0" max="719" placeholder="off">
+    <label>Retarget mid-move</label><select id="setRetarget">
+      <option value="stop_first">Stop, then turn</option>
+      <option value="direct">Send new target directly</option>
+    </select>
+    <label>Wait after stop (s)</label><input type="number" id="setSettle" min="0" max="10" step="0.5">
+    <div class="hint">Match or exceed the RT-21's DELAYS setting (default 3 s) plus a margin.</div>
     <textarea id="setPresets" spellcheck="false"></textarea>
     <div class="hint">Beam headings, one per line: <b>name, degrees</b> (e.g. <code>EU, 30</code>)</div>
   </div>
@@ -1498,8 +2358,10 @@ const $ = id => document.getElementById(id);
 /* ------------------------------------------------------------------ state */
 const S = {
   link: "disconnected", detail: "", heading: null, moving: false,
-  target: null, dragTarget: null, cfg: null, raw: false,
+  target: null, targetSource: null, dragTarget: null, cfg: null, raw: false,
+  listeners: {}, skinId: "", skinImg: null,
 };
+const SOURCES = {web: "web", n1mm: "N1MM", hamlib: "Hamlib", pst: "PstRotator"};
 
 /* ------------------------------------------------------------- API helper */
 async function api(path, body) {
@@ -1534,7 +2396,8 @@ function connectEvents() {
     S.moving = JSON.parse(e.data).moving; renderHeading(); draw();
   });
   es.addEventListener("target", e => {
-    S.target = JSON.parse(e.data).deg; renderHeading(); draw();
+    const d = JSON.parse(e.data);
+    S.target = d.deg; S.targetSource = d.source || null; renderHeading(); draw();
   });
   es.addEventListener("info", e => {
     const t = JSON.parse(e.data).text;
@@ -1549,7 +2412,10 @@ function connectEvents() {
     const d = JSON.parse(e.data);
     addLine(d.level === "WARNING" ? "warn" : d.level === "ERROR" ? "err" : "log", d.text);
   });
-  es.addEventListener("config", e => { S.cfg = JSON.parse(e.data); renderPresets(); draw(); });
+  es.addEventListener("listeners", e => {
+    Object.assign(S.listeners, JSON.parse(e.data)); renderListeners();
+  });
+  es.addEventListener("config", e => { S.cfg = JSON.parse(e.data); renderPresets(); applySkin(); draw(); });
   es.onerror = () => {
     S.link = "ui-lost"; S.detail = "Lost contact with the controller app";
     renderStatus();     /* EventSource reconnects on its own */
@@ -1559,9 +2425,11 @@ function connectEvents() {
 function applySnapshot(snap) {
   S.link = snap.link; S.detail = snap.detail; S.heading = snap.heading;
   S.moving = snap.moving; S.target = snap.target; S.cfg = snap.config;
+  S.targetSource = snap.target_source || null; S.listeners = snap.listeners || {};
   S.raw = !!snap.config.show_raw_traffic;
   $("rawChk").checked = S.raw;
   document.documentElement.dataset.theme = snap.config.dark_mode ? "dark" : "light";
+  applySkin();
   $("target").max = snap.config.max_heading;
   $("connInfo").textContent = snap.config.host + ":" + snap.config.port +
                               " · unit " + snap.config.unit;
@@ -1574,7 +2442,20 @@ function applySnapshot(snap) {
       addLine(line.level === "WARNING" ? "warn" : line.level === "ERROR" ? "err" : "log", line.text);
     } else addLine("info", line.text);
   }
-  renderStatus(); renderHeading(); renderPresets(); draw();
+  renderStatus(); renderHeading(); renderPresets(); renderListeners(); draw();
+}
+
+function renderListeners() {
+  const names = {n1mm: "N1MM", hamlib: "Hamlib", pst: "PstRotator"};
+  const parts = [];
+  for (const [key, info] of Object.entries(S.listeners)) {
+    if (!info) continue;
+    if (info.error) { parts.push(names[key] + " ✕"); continue; }
+    let t = names[key] + " :" + info.port;
+    if (key === "hamlib" && info.clients) t += " (" + info.clients + ")";
+    parts.push(t);
+  }
+  $("listenInfo").textContent = parts.length ? "listening · " + parts.join(" · ") : "";
 }
 
 /* -------------------------------------------------------------- rendering */
@@ -1598,7 +2479,9 @@ function renderHeading() {
   if (S.moving && S.target != null) {
     let d = (S.target - S.heading) % 360; if (d > 180) d -= 360; if (d < -180) d += 360;
     sub.textContent = "rotating · " + Math.abs(Math.round(d)) + "° " +
-                      (d >= 0 ? "CW" : "CCW") + " to " + Math.round(S.target) + "°";
+                      (d >= 0 ? "CW" : "CCW") + " to " + Math.round(S.target) + "°" +
+                      (S.targetSource && S.targetSource !== "web"
+                        ? " · " + (SOURCES[S.targetSource] || S.targetSource) : "");
     sub.className = "moving";
   } else if (S.moving) { sub.textContent = "rotating"; sub.className = "moving"; }
   else { sub.textContent = "stopped"; sub.className = ""; }
@@ -1644,28 +2527,45 @@ function draw() {
   const cx = w / 2, cy = w / 2, R = w / 2 - 14;
   const line = cssVar("--line"), dim = cssVar("--dim"), text = cssVar("--text");
 
-  g.lineWidth = 2; g.strokeStyle = line;
-  g.beginPath(); g.arc(cx, cy, R, 0, Math.PI * 2); g.stroke();
-  g.beginPath(); g.arc(cx, cy, R * 0.62, 0, Math.PI * 2);
-  g.strokeStyle = line; g.globalAlpha = 0.5; g.stroke(); g.globalAlpha = 1;
+  const skin = S.skinImg && S.skinImg.complete && S.skinImg.naturalWidth ? S.skinImg : null;
+  const scale = !skin || (S.cfg && S.cfg.skin_overlay !== false);
+  if (skin) {
+    g.save();
+    g.beginPath(); g.arc(cx, cy, R + 8, 0, Math.PI * 2); g.clip();
+    g.drawImage(skin, cx - R - 8, cy - R - 8, (R + 8) * 2, (R + 8) * 2);
+    g.restore();
+  }
+  g.lineWidth = 2; g.strokeStyle = skin ? "rgba(0,0,0,.55)" : line;
+  g.beginPath(); g.arc(cx, cy, R + (skin ? 8 : 0), 0, Math.PI * 2); g.stroke();
+  if (!skin) {
+    g.beginPath(); g.arc(cx, cy, R * 0.62, 0, Math.PI * 2);
+    g.strokeStyle = line; g.globalAlpha = 0.5; g.stroke(); g.globalAlpha = 1;
+  }
 
   /* ticks + labels */
-  for (let d = 0; d < 360; d += 5) {
+  for (let d = 0; d < 360 && scale; d += 5) {
     const major = d % 30 === 0, mid = d % 10 === 0;
     const a = (d - 90) * Math.PI / 180;
     const r1 = R, r2 = R - (major ? 14 : mid ? 9 : 5);
-    g.strokeStyle = major ? dim : line; g.lineWidth = major ? 2 : 1;
     g.beginPath();
     g.moveTo(cx + r1 * Math.cos(a), cy + r1 * Math.sin(a));
     g.lineTo(cx + r2 * Math.cos(a), cy + r2 * Math.sin(a));
+    if (skin) {   /* dark halo so ticks stay readable on any artwork */
+      g.strokeStyle = "rgba(0,0,0,.6)"; g.lineWidth = (major ? 2 : 1) + 2.5; g.stroke();
+    }
+    g.strokeStyle = skin ? "#fff" : (major ? dim : line); g.lineWidth = major ? 2 : 1;
     g.stroke();
     if (major) {
       const cardinal = {0: "N", 90: "E", 180: "S", 270: "W"}[d];
       const rl = R - 28;
-      g.fillStyle = cardinal ? text : dim;
+      g.fillStyle = skin ? "#fff" : (cardinal ? text : dim);
       g.font = (cardinal ? "700 " + Math.max(15, w * 0.038) : "500 " + Math.max(11, w * 0.024)) +
                "px -apple-system, sans-serif";
       g.textAlign = "center"; g.textBaseline = "middle";
+      if (skin) {
+        g.lineJoin = "round"; g.lineWidth = 4; g.strokeStyle = "rgba(0,0,0,.7)";
+        g.strokeText(cardinal || String(d), cx + rl * Math.cos(a), cy + rl * Math.sin(a));
+      }
       g.fillText(cardinal || String(d), cx + rl * Math.cos(a), cy + rl * Math.sin(a));
     }
   }
@@ -1699,7 +2599,9 @@ function draw() {
     g.lineTo(cx + side * Math.cos(pa), cy + side * Math.sin(pa));
     g.lineTo(backX, backY);
     g.lineTo(cx - side * Math.cos(pa), cy - side * Math.sin(pa));
-    g.closePath(); g.fill();
+    g.closePath();
+    if (skin) { g.lineJoin = "round"; g.lineWidth = 3; g.strokeStyle = "rgba(255,255,255,.85)"; g.stroke(); }
+    g.fill();
   }
 
   /* hub */
@@ -1789,6 +2691,12 @@ $("settingsBtn").onclick = () => {
   $("setTransport").value = S.cfg.transport || "auto";
   $("setUnit").value = S.cfg.unit; $("setMax").value = S.cfg.max_heading;
   $("setPoll").value = S.cfg.poll_interval;
+  $("setN1mm").checked = !!S.cfg.n1mm_enabled;
+  $("setHamlib").checked = !!S.cfg.hamlib_enabled; $("setHamlibPort").value = S.cfg.hamlib_port;
+  $("setPst").checked = !!S.cfg.pst_enabled; $("setPstPort").value = S.cfg.pst_port;
+  $("setPark").value = S.cfg.park_heading == null ? "" : S.cfg.park_heading;
+  $("setRetarget").value = S.cfg.retarget_mode || "stop_first";
+  $("setSettle").value = (S.cfg.retarget_settle_ms ?? 3500) / 1000;
   $("setPresets").value = S.cfg.presets.map(p => p.name + ", " + p.heading).join("\n");
   $("settingsDlg").showModal();
 };
@@ -1805,10 +2713,81 @@ $("setSave").onclick = async () => {
     unit: parseInt($("setUnit").value, 10) || 1,
     max_heading: parseInt($("setMax").value, 10) || 359,
     poll_interval: parseFloat($("setPoll").value) || 1.0,
+    n1mm_enabled: $("setN1mm").checked,
+    hamlib_enabled: $("setHamlib").checked,
+    hamlib_port: parseInt($("setHamlibPort").value, 10) || 4533,
+    pst_enabled: $("setPst").checked,
+    pst_port: parseInt($("setPstPort").value, 10) || 12000,
+    park_heading: $("setPark").value.trim() === "" ? null : parseInt($("setPark").value, 10),
+    retarget_mode: $("setRetarget").value,
+    retarget_settle_ms: Math.round((parseFloat($("setSettle").value) || 0) * 1000),
     presets,
   });
   if (ok) $("settingsDlg").close();
 };
+
+/* ------------------------------------------------------------------ skins */
+function applySkin() {
+  const id = (S.cfg && S.cfg.skin) || "";
+  if (id === S.skinId) return;
+  S.skinId = id;
+  if (!id) { S.skinImg = null; draw(); return; }
+  const img = new Image();
+  img.onload = () => { if (S.skinId === id) { S.skinImg = img; draw(); } };
+  img.onerror = () => { if (S.skinId === id) { S.skinImg = null; draw(); } };
+  img.src = "/skins/" + encodeURIComponent(id) + ".webp";
+}
+
+let skinList = [];
+function skinCredit(id) {
+  const box = $("skinCredit"); box.textContent = "";
+  const s = skinList.find(x => x.id === id);
+  if (!s) { box.textContent = "Classic drawn rose."; return; }
+  box.append(s.name + " — " + (s.credit || "unknown") + " · " + (s.license || "license unknown") + " · ");
+  if (/^https:\/\//.test(s.source)) {
+    const a = document.createElement("a");
+    a.href = s.source; a.target = "_blank"; a.rel = "noopener"; a.textContent = "source";
+    box.append(a);
+  } else box.append(s.source || "");
+}
+function renderSkins() {
+  const grid = $("skinGrid"); grid.textContent = "";
+  const add = (id, label, thumb) => {
+    const b = document.createElement("button");
+    b.className = "skin"; b.type = "button";
+    b.setAttribute("aria-pressed", String((S.cfg.skin || "") === id));
+    b.append(thumb, label);
+    b.onclick = async () => {
+      if (await api("/api/config", {skin: id})) { S.cfg.skin = id; applySkin(); renderSkins(); }
+    };
+    b.onmouseenter = b.onfocus = () => skinCredit(id);
+    b.onmouseleave = b.onblur = () => skinCredit(S.cfg.skin || "");
+    grid.append(b);
+  };
+  const none = document.createElement("div"); none.className = "none"; none.textContent = "∅";
+  add("", "Classic", none);
+  for (const s of skinList) {
+    const img = document.createElement("img");
+    img.src = "/skins/" + encodeURIComponent(s.id) + ".webp"; img.alt = ""; img.loading = "lazy";
+    img.width = img.height = 84;
+    add(s.id, s.name, img);
+  }
+  skinCredit(S.cfg.skin || "");
+}
+$("skinBtn").onclick = async () => {
+  if (!S.cfg) return;
+  try { skinList = (await (await fetch("/api/skins")).json()).skins || []; }
+  catch (e) { skinList = []; }
+  $("skinOverlay").checked = S.cfg.skin_overlay !== false;
+  renderSkins();
+  $("skinDlg").showModal();
+};
+$("skinOverlay").onchange = async () => {
+  if (await api("/api/config", {skin_overlay: $("skinOverlay").checked})) {
+    S.cfg.skin_overlay = $("skinOverlay").checked; draw();
+  }
+};
+$("skinDone").onclick = () => $("skinDlg").close();
 
 window.addEventListener("resize", draw);
 connectEvents();
@@ -1835,6 +2814,10 @@ def parse_args(argv: "Optional[list[str]]" = None) -> argparse.Namespace:
     ap.add_argument("--n1mm", action="store_true",
                     help="accept rotator commands from N1MM Logger+ "
                          "(UDP port 12040, heading reports on 13010)")
+    ap.add_argument("--hamlib", action="store_true",
+                    help="run a Hamlib rotctld-compatible server (TCP port 4533)")
+    ap.add_argument("--pst", action="store_true",
+                    help="accept PstRotator UDP commands (port 12000, replies on 12001)")
     ap.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
     ap.add_argument("--reset-config", action="store_true", help="start from factory settings")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
@@ -1863,6 +2846,10 @@ def main(argv: "Optional[list[str]]" = None) -> int:
         cfg.http_port = args.http_port
     if args.n1mm:
         cfg.n1mm_enabled = True
+    if args.hamlib:
+        cfg.hamlib_enabled = True
+    if args.pst:
+        cfg.pst_enabled = True
     cfg.sanitize()
 
     sim: Optional[Rt21Simulator] = None
@@ -1880,20 +2867,15 @@ def main(argv: "Optional[list[str]]" = None) -> int:
     LOG.addHandler(HubLogHandler(hub))
     manager = LinkManager(cfg, hub)
 
-    bridge: Optional[N1mmBridge] = None
-    if cfg.n1mm_enabled:
-        try:
-            bridge = N1mmBridge(cfg, hub, manager)
-            bridge.start()
-        except OSError as exc:
-            LOG.error("N1MM bridge disabled — cannot bind UDP port %d: %s",
-                      cfg.n1mm_port, exc)
+    listeners = ListenerSet(cfg, hub, manager)
+    listeners.apply()
 
-    Handler.ctx = AppContext(cfg, hub, manager)
+    Handler.ctx = AppContext(cfg, hub, manager, listeners)
     try:
         httpd = ThreadingHTTPServer((args.listen, cfg.http_port), Handler)
     except OSError as exc:
         LOG.error("Cannot bind web UI to %s:%d: %s", args.listen, cfg.http_port, exc)
+        listeners.shutdown()
         return 1
     httpd.daemon_threads = True
 
@@ -1909,14 +2891,21 @@ def main(argv: "Optional[list[str]]" = None) -> int:
     if not args.no_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
 
+    def _terminate(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt           # SIGTERM (launchd, systemd, kill) = Ctrl-C
+
+    try:
+        signal.signal(signal.SIGTERM, _terminate)
+    except (ValueError, OSError):         # not the main thread, or unsupported
+        pass
+
     try:
         httpd.serve_forever(poll_interval=0.3)
     except KeyboardInterrupt:
         LOG.info("Interrupted — shutting down")
     finally:
         httpd.server_close()
-        if bridge is not None:
-            bridge.shutdown()
+        listeners.shutdown()
         manager.disconnect()
         if sim is not None:
             sim.shutdown()
