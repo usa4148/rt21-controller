@@ -9,6 +9,10 @@ means you can open it from a phone or tablet in the shack.
 
 ![The RT-21 web UI: compass rose, target controls, and beam-heading presets](docs/screenshot.png)
 
+Pick a dial skin with the **Skins** button — the scale and needles stay live on top:
+
+![The same UI with the 1748 Bowen compass-rose skin behind the dial](docs/screenshot-skin.png)
+
 History: the original client is `rt21_network_controller.py` (untouched);
 version 2.0 was a PyQt6 rewrite (`rt21_controller.py`, still here) whose Qt
 platform plugin broke on macOS 26. Version 3.0 keeps 2.0's protocol fixes
@@ -94,7 +98,8 @@ the page can turn the rotator — so only open it up on a network you trust.
   rendered readably.
 - **Dial skins** — the **Skins** button swaps the drawn rose for one of 10
   public-domain compass-rose artworks (charts and engravings). The scale and needles are
-  still drawn on top; a checkbox hides the scale. See [docs/skins.md](docs/skins.md).
+  still drawn on top; a checkbox hides the scale. Ten public-domain skins ship
+  with the app. See [docs/skins.md](docs/skins.md).
 - Dark and light themes (◐), responsive layout for phone screens.
 - Shortcuts: **Esc** stop, **Enter** slew.
 - Every open browser tab stays in sync — the app pushes updates over

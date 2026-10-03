@@ -4,6 +4,7 @@
     pip install -r tools/requirements.txt
     python3 tools/make_skins.py            # skins/raw/* + skins/sources.json -> skins/*.webp + skins/skins.json
     python3 tools/make_skins.py --check    # validate sources.json only, write nothing
+    python3 tools/make_skins.py --gallery  # also redraw docs/skins-gallery.png
 
 Each skin becomes a square, metadata-free WebP (default 800x800, quality 82)
 whose rose is centred and fills the frame; the app clips it to a circle.
@@ -92,9 +93,33 @@ def build(data: dict, only: set[str] | None) -> list[dict]:
     return index
 
 
+def gallery(index: list[dict], out: Path, thumb: int = 200, cols: int = 5) -> None:
+    """Contact sheet of round thumbnails, used by docs/skins.md."""
+    from PIL import Image, ImageDraw, ImageFont
+    pad, label = 24, 34
+    rows = -(-len(index) // cols)
+    sheet = Image.new("RGB", (cols * (thumb + pad) + pad, rows * (thumb + label + pad) + pad), (26, 32, 41))
+    draw = ImageDraw.Draw(sheet)
+    try:
+        font = ImageFont.truetype("Helvetica.ttc", 15)
+    except OSError:
+        font = ImageFont.load_default()
+    mask = Image.new("L", (thumb * 4, thumb * 4), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, thumb * 4 - 1, thumb * 4 - 1), fill=255)
+    mask = mask.resize((thumb, thumb), Image.LANCZOS)
+    for i, s in enumerate(index):
+        x, y = pad + i % cols * (thumb + pad), pad + i // cols * (thumb + label + pad)
+        im = Image.open(SKINS / s["image"]).convert("RGB").resize((thumb, thumb), Image.LANCZOS)
+        sheet.paste(im, (x, y), mask)
+        width = draw.textlength(s["name"], font=font)
+        draw.text((x + (thumb - width) / 2, y + thumb + 8), s["name"], fill=(232, 237, 244), font=font)
+    sheet.quantize(colors=256, dither=Image.Dither.NONE).save(out, optimize=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--check", action="store_true", help="validate sources.json and exit")
+    ap.add_argument("--gallery", action="store_true", help="also redraw docs/skins-gallery.png")
     ap.add_argument("--only", nargs="*", help="rebuild just these skin ids")
     args = ap.parse_args()
     data = load_sources(SKINS / "sources.json")
@@ -105,6 +130,8 @@ def main() -> int:
     if not args.only:
         (SKINS / "skins.json").write_text(
             json.dumps({"skins": index}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        if args.gallery:
+            gallery(index, ROOT / "docs" / "skins-gallery.png")
     return 0
 
 

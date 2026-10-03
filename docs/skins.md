@@ -6,6 +6,10 @@ nothing about steering changes. Pick one with the **Skins** button in the
 header; the choice is saved in `config.json` (`skin`, and `skin_overlay` for the
 degree scale) and is shared by every browser tab.
 
+![The ten shipped skins](skins-gallery.png)
+
+![The web UI with the Bowen 1748 skin](screenshot-skin.png)
+
 ## What ships
 
 Ten skins in `skins/`, each one a single `<id>.webp`:
@@ -64,7 +68,7 @@ pip install -r tools/requirements.txt      # Pillow + resvg-py, build-time only
 
    ```sh
    python3 tools/make_skins.py --only my-rose   # one skin
-   python3 tools/make_skins.py                  # everything, and regenerate skins.json
+   python3 tools/make_skins.py --gallery        # everything, regenerate skins.json and the gallery image
    python3 tools/make_skins.py --check          # validate sources.json only
    ```
 4. `python3 test_skins.py` checks that the index and files agree, every skin is
@@ -72,6 +76,10 @@ pip install -r tools/requirements.txt      # Pillow + resvg-py, build-time only
 
 Commit `skins/*.webp`, `skins/skins.json` and `skins/sources.json`. `skins/raw/`
 is git-ignored.
+
+The screenshots in `docs/` (`screenshot.png`, `screenshot-skin.png`) are taken
+by hand against the demo simulator (`python3 rt21_web.py --demo`) at 1280 × 775;
+retake them when the UI changes.
 
 ## How the app serves them
 
