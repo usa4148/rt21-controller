@@ -14,6 +14,7 @@ import socket
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -276,6 +277,15 @@ class ConfigTests(unittest.TestCase):
         cfg.sanitize()
         self.assertEqual(cfg.presets, [{"name": "OK", "heading": 359}])
 
+    def test_sanitize_skin(self) -> None:
+        for bad in ("../etc/passwd", "UPPER", "a b", "x" * 41, None):
+            cfg = Config(skin=bad)  # type: ignore[arg-type]
+            cfg.sanitize()
+            self.assertEqual(cfg.skin, "", bad)
+        cfg = Config(skin="noaa-black", skin_overlay=0)  # type: ignore[arg-type]
+        cfg.sanitize()
+        self.assertEqual((cfg.skin, cfg.skin_overlay), ("noaa-black", False))
+
     def test_sanitize_bad_host(self) -> None:
         cfg = Config(host="  ")
         cfg.sanitize()
@@ -444,6 +454,45 @@ class HttpApiTests(unittest.TestCase):
             snap = json.loads(data[6:])
             self.assertIn("config", snap)
             self.assertIn("link", snap)
+
+    def _get_raw(self, path: str):
+        try:
+            return urllib.request.urlopen(self.base + path, timeout=5)
+        except urllib.error.HTTPError as e:
+            return e
+
+    def test_08b_skin_catalog_and_images(self) -> None:
+        skins = self._get("/api/skins")["skins"]
+        self.assertGreaterEqual(len(skins), 1)
+        for skin in skins:
+            for key in ("id", "name", "credit", "license", "source"):
+                self.assertIn(key, skin)
+        with self._get_raw(f"/skins/{skins[0]['id']}.webp") as r:
+            body = r.read()
+            self.assertEqual(r.status, 200)
+            self.assertEqual(r.headers["Content-Type"], "image/webp")
+        self.assertEqual(body[:4], b"RIFF")
+        self.assertEqual(body[8:12], b"WEBP")
+
+    def test_08c_skin_paths_are_whitelisted(self) -> None:
+        for path in ("/skins/nope.webp", "/skins/sources.json", "/skins/skins.webp",
+                     "/skins/..%2Frt21_web.webp", "/skins/%2e%2e/rt21_web.webp",
+                     "/skins/raw/Compass_Rose-Black.webp"):
+            r = self._get_raw(path)
+            self.assertEqual(r.code, 404, path)
+
+    def test_08d_config_skin_roundtrip(self) -> None:
+        skin = self._get("/api/skins")["skins"][0]["id"]
+        code, _ = self._post("/api/config", {"skin": skin, "skin_overlay": False})
+        self.assertEqual(code, 200)
+        cfg = self._get("/api/state")["config"]
+        self.assertEqual((cfg["skin"], cfg["skin_overlay"]), (skin, False))
+        code, _ = self._post("/api/config", {"skin": "no-such-skin"})
+        self.assertEqual(code, 400)
+        self.assertEqual(self._get("/api/state")["config"]["skin"], skin)  # unchanged
+        code, _ = self._post("/api/config", {"skin": "", "skin_overlay": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(self._get("/api/state")["config"]["skin"], "")
 
     def test_09_disconnect(self) -> None:
         code, _ = self._post("/api/disconnect")

@@ -92,6 +92,9 @@ the page can turn the rotator — so only open it up on a network you trust.
 - **Console** (click "console" in the footer) with an optional wire-traffic
   view showing exactly what goes out and comes back, `<SOH>` and `<CR>`
   rendered readably.
+- **Dial skins** — the **Skins** button swaps the drawn rose for one of 10
+  public-domain compass-rose artworks (charts and engravings). The scale and needles are
+  still drawn on top; a checkbox hides the scale. See [docs/skins.md](docs/skins.md).
 - Dark and light themes (◐), responsive layout for phone screens.
 - Shortcuts: **Esc** stop, **Enter** slew.
 - Every open browser tab stays in sync — the app pushes updates over
@@ -283,6 +286,9 @@ state.
 The config file is shared with the 2.0 client; keys the web edition does not
 use are preserved. Logs rotate at 1 MB, five files kept.
 
+Dial skins ship with the app in `skins/` (next to `rt21_web.py`); only your
+choice (`skin`, `skin_overlay`) is stored in the config file.
+
 ## Verification
 
 `test_web.py` runs the whole stack headless against built-in simulators for
@@ -295,12 +301,16 @@ stale-link watchdog, drop-and-reconnect, and clean thread shutdown:
 python3 test_web.py
 ```
 
+`test_skins.py` checks the shipped dial skins (see [docs/skins.md](docs/skins.md)):
+index and files agree, every image is 800 × 800 WebP under 300 KB with no
+metadata, every skin is credited, and the server only serves listed ids.
+
 The suite also emulates N1MM Logger+, Hamlib clients and PstRotator over
 real sockets: latest-command-wins overrides between sources, burst
 coalescing, stop priority, the Hamlib client cap and malformed input, the
 PstRotator reply port, listener restarts, and clean shutdown.
 
-80 tests, ~50 s, no dependencies; passes on Python 3.9 through 3.14. The
+84 tests (plus 6 in `test_skins.py`), ~50 s, no dependencies; passes on Python 3.9 through 3.14. The
 Hamlib server was also checked with Hamlib 4.5.5's own `rotctl -m 2`. Also verified live against the real RT-21
 (firmware 4.13.2) through its GH Everywhere interface: connect, poll, slew,
 motion status and return-to-heading all confirmed end to end.
