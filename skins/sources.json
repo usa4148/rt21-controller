@@ -89,7 +89,12 @@
       "file": "Bowen_1748_Compass_rose.jpg",
       "credit": "Bowen",
       "license": "Public domain",
-      "source": "https://commons.wikimedia.org/wiki/File:Compass_rose_detail_from_1748_Bowen_Mariner%E2%80%99s_Compass_and_Armillary_Sphere_-_Geographicus_-_CircleofWinds-bowen-1747_(cropped).jpg"
+      "source": "https://commons.wikimedia.org/wiki/File:Compass_rose_detail_from_1748_Bowen_Mariner%E2%80%99s_Compass_and_Armillary_Sphere_-_Geographicus_-_CircleofWinds-bowen-1747_(cropped).jpg",
+      "center": [
+        0.498,
+        0.505
+      ],
+      "span": 0.93
     },
     {
       "id": "boazio-1585",
