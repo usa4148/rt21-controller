@@ -8,8 +8,8 @@
 
 Each skin becomes a square, metadata-free WebP (default 800x800, quality 82)
 whose rose is centred and fills the frame; the app clips it to a circle.
-Raw originals stay out of git (skins/raw/); sources.json records where each
-came from, and skins.json is the generated index the app reads.
+Third-party originals stay out of git (skins/raw/); our own art lives in
+skins/art/. sources.json records where each came from, and skins.json is the generated index the app reads.
 """
 from __future__ import annotations
 
@@ -21,7 +21,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SKINS = ROOT / "skins"
-RAW = SKINS / "raw"
+RAW = SKINS / "raw"          # third-party originals: git-ignored
+ART = SKINS / "art"          # our own source art: committed
 FIELDS = ("id", "name", "file", "credit", "license", "source")
 
 
@@ -81,9 +82,9 @@ def build(data: dict, only: set[str] | None) -> list[dict]:
     for s in data["skins"]:
         if only and s["id"] not in only:
             continue
-        src = RAW / s["file"]
-        if not src.is_file():
-            print(f"  skip {s['id']}: {src} not found", file=sys.stderr)
+        src = next((d / s["file"] for d in (ART, RAW) if (d / s["file"]).is_file()), None)
+        if src is None:
+            print(f"  skip {s['id']}: {s['file']} not in {ART.name}/ or {RAW.name}/", file=sys.stderr)
             continue
         im = square(open_source(src, size * 2), s).resize((size, size), Image.LANCZOS)
         out = SKINS / f"{s['id']}.webp"
@@ -93,7 +94,7 @@ def build(data: dict, only: set[str] | None) -> list[dict]:
     return index
 
 
-def gallery(index: list[dict], out: Path, thumb: int = 200, cols: int = 5) -> None:
+def gallery(index: list[dict], out: Path, thumb: int = 200, cols: int = 6) -> None:
     """Contact sheet of round thumbnails, used by docs/skins.md."""
     from PIL import Image, ImageDraw, ImageFont
     pad, label = 24, 34

@@ -1,6 +1,14 @@
 {
   "skins": [
     {
+      "id": "octagram-rose",
+      "name": "Octagram Rose",
+      "credit": "RT-21 Controller project",
+      "license": "CC0",
+      "source": "skins/art/octagram-rose.svg",
+      "image": "octagram-rose.webp"
+    },
+    {
       "id": "noaa-black",
       "name": "NOAA Black",
       "credit": "NOAA, DoC, DoD, NGA",

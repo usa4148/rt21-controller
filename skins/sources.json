@@ -3,6 +3,14 @@
   "quality": 82,
   "skins": [
     {
+      "id": "octagram-rose",
+      "name": "Octagram Rose",
+      "file": "octagram-rose.svg",
+      "credit": "RT-21 Controller project",
+      "license": "CC0",
+      "source": "skins/art/octagram-rose.svg"
+    },
+    {
       "id": "noaa-black",
       "name": "NOAA Black",
       "file": "Compass_Rose-Black.svg",

@@ -98,7 +98,7 @@ the page can turn the rotator — so only open it up on a network you trust.
   rendered readably.
 - **Dial skins** — the **Skins** button swaps the drawn rose for one of 10
   public-domain compass-rose artworks (charts and engravings). The scale and needles are
-  still drawn on top; a checkbox hides the scale. Ten public-domain skins ship
+  still drawn on top; a checkbox hides the scale. Eleven public-domain or CC0 skins ship
   with the app. See [docs/skins.md](docs/skins.md).
 - Dark and light themes (◐), responsive layout for phone screens.
 - Shortcuts: **Esc** stop, **Enter** slew.
